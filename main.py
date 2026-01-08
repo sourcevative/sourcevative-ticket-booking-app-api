@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
 from dotenv import load_dotenv
@@ -17,6 +18,15 @@ app = FastAPI(
     version="1.0"
 )
 
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
+
 
 # -------------------------
 # Request Body
@@ -32,7 +42,12 @@ class LoginRequest(BaseModel):
     password: str
 
 class ForgotPasswordRequest(BaseModel):
-    email: str
+    login: str   # email OR phone
+
+
+class DirectResetRequest(BaseModel):
+    user_id: str
+    new_password: str
 
 class ResetPasswordRequest(BaseModel):
     access_token: str
@@ -118,36 +133,40 @@ def login_email_or_Phone_no(data: LoginRequest):
 # -------------------------
 @app.post("/forgot-password", tags=["Authentication"])
 def forgot_password(data: ForgotPasswordRequest):
-    try:
-        supabase.auth.reset_password_for_email(
-            data.email,
-            {"redirect_to": "http://localhost:3000/reset-password"}
+
+    if "@" in data.login:
+        res = supabase.table("profiles").select("id").eq("email", data.login).execute()
+    else:
+        res = supabase.table("profiles").select("id").eq("phone", data.login).execute()
+
+    if len(res.data) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Account not found. Please signup first."
         )
 
-        return {
-            "status": "success",
-            "message": "Reset password link sent to your email"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "status": "verified",
+        "user_id": res.data[0]["id"]
+    }
 
 # -------------------------
 # Reset Password API
 # -------------------------
-@app.post("/reset-password", tags=["Authentication"])
-def reset_password(data: ResetPasswordRequest):
-    try:
-        supabase.auth.set_session(data.access_token, "")
 
-        supabase.auth.update_user({
-            "password": data.new_password
-        })
+@app.post("/reset-password-direct", tags=["Authentication"])
+def reset_password_direct(data: DirectResetRequest):
+
+    try:
+        supabase.auth.admin.update_user_by_id(
+            data.user_id,
+            {"password": data.new_password}
+        )
 
         return {
             "status": "success",
             "message": "Password updated successfully"
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+    except:
+        raise HTTPException(status_code=400, detail="Reset failed")
