@@ -13,7 +13,8 @@ import re
 from supabase import create_client
 from dotenv import load_dotenv
 from fastapi import Body
-from datetime import date
+from datetime import datetime, timedelta
+from datetime import datetime, date
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -650,155 +651,89 @@ def logout(data: LogoutRequest):
 @app.post("/forgot-password", tags=["Authentication"])
 def forgot_password(data: ForgotPasswordRequest):
 
+    # 1. Find user
     if "@" in data.login:
-        res = supabase.table("profiles").select("id").eq("email", data.login).execute()
+        res = supabase.table("profiles").select("id, email").eq("email", data.login).execute()
     else:
-        res = supabase.table("profiles").select("id").eq("phone", data.login).execute()
+        res = supabase.table("profiles").select("id, email").eq("phone", data.login).execute()
 
-    if len(res.data) == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Account not found. Please signup first."
-        )
+    if not res.data:
+        # Don't reveal if account exists (security)
+        return {"status": "ok", "message": "If account exists, reset link has been sent"}
 
-    return {
-        "status": "verified",
-        "user_id": res.data[0]["id"]
-    }
+    user = res.data[0]
+
+    # 2. Generate secure token
+    token = secrets.token_urlsafe(32)
+
+    expires_at = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
+
+    # 3. Store token
+    supabase.table("password_reset_tokens").insert({
+        "user_id": user["id"],
+        "token": token,
+        "expires_at": expires_at
+    }).execute()
+
+    # 4. Send email
+    reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
+
+    send_email(
+        user["email"],
+        "Reset Your Animal Farm Password",
+        f"""
+        <h3>Reset Password</h3>
+        <p>Click the link below to reset your password:</p>
+        <a href="{reset_link}">{reset_link}</a>
+        <p>This link is valid for 30 minutes.</p>
+        """
+    )
+
+    return {"status": "ok", "message": "If account exists, reset link has been sent"}
 
 # -------------------------
 # Reset Password API
 # -------------------------
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
-@app.post("/reset-password-direct", tags=["Authentication"])
-async def reset_password_direct(request: Request):
-    """
-    Reset password directly using user_id.
-    This endpoint matches the frontend reset password page that accepts user_id from URL params.
-    Accepts both snake_case (user_id, new_password) and camelCase (userId, newPassword) field names.
-    """
-    try:
-        # Parse request body manually to handle both naming conventions
-        body = await request.json()
-        
-        # Normalize field names: accept both snake_case and camelCase
-        user_id = body.get("user_id") or body.get("userId")
-        new_password = body.get("new_password") or body.get("newPassword")
-        
-        # Validate required fields
-        if not user_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing required field: 'user_id' or 'userId'"
-            )
-        if not new_password:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing required field: 'new_password' or 'newPassword'"
-            )
-        
-        # Normalize user_id (strip whitespace)
-        user_id = str(user_id).strip()
-        new_password = str(new_password)
-        
-    except HTTPException:
-        raise
-    except Exception as parse_error:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid request body: {str(parse_error)}"
-        )
-    
-    try:
-        # Check if user_id is provided (matches frontend validation)
-        if not user_id or user_id == "":
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid reset link. Please request a new password reset."
-            )
+@app.post("/reset-password", tags=["Authentication"])
+def reset_password(data: ResetPasswordRequest):
 
-        # Validate user_id is a valid UUID format
-        try:
-            uuid.UUID(user_id)
-        except (ValueError, AttributeError):
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid reset link. Please request a new password reset."
-            )
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
-        # Validate password is provided and meets minimum length requirement
-        if not new_password or len(new_password) < 6:
-            raise HTTPException(
-                status_code=400, 
-                detail="Password must be at least 6 characters long."
-            )
+    # 1. Find token
+    token_row = supabase.table("password_reset_tokens") \
+        .select("*") \
+        .eq("token", data.token) \
+        .execute()
 
-        # Verify user exists in profiles table
-        profile_result = supabase.table("profiles").select("id, email").eq("id", user_id).execute()
-        
-        if len(profile_result.data) == 0:
-            raise HTTPException(
-                status_code=404, 
-                detail="Invalid reset link. Please request a new password reset."
-            )
+    if not token_row.data:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
 
-        # Update password using admin API
-        try:
-            result = supabase.auth.admin.update_user_by_id(
-                user_id,
-                {"password": new_password}
-            )
+    token_data = token_row.data[0]
 
-            return {
-                "status": "success",
-                "message": "Your password has been updated successfully."
-            }
-        
-        except Exception as supabase_error:
-            error_message = str(supabase_error)
-            error_lower = error_message.lower()
-            
-            # Handle specific Supabase errors with user-friendly messages
-            if "user_not_found" in error_lower or "user not found" in error_lower:
-                raise HTTPException(
-                    status_code=404, 
-                    detail="Invalid reset link. Please request a new password reset."
-                )
-            elif "weak_password" in error_lower:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Password is too weak. Please choose a stronger password."
-                )
-            elif "same_password" in error_lower:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="New password must be different from the current password."
-                )
-            elif "not_admin" in error_lower or "no_authorization" in error_lower or "unauthorized" in error_lower:
-                raise HTTPException(
-                    status_code=500, 
-                    detail="We could not reset your password. Please try again."
-                )
-            elif "invalid" in error_lower and "uuid" in error_lower:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Invalid reset link. Please request a new password reset."
-                )
-            else:
-                # Generic error message for unknown errors
-                raise HTTPException(
-                    status_code=400, 
-                    detail="We could not reset your password. Please try again."
-                )
+    # 2. Check expiry
+    if datetime.fromisoformat(token_data["expires_at"]) < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Reset link expired")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Catch any unexpected errors and return user-friendly message
-        raise HTTPException(
-            status_code=400, 
-            detail="We could not reset your password. Please try again."
-        )
+    user_id = token_data["user_id"]
+
+    # 3. Update password
+    supabase.auth.admin.update_user_by_id(user_id, {
+        "password": data.new_password
+    })
+
+    # 4. Delete token (one-time use)
+    supabase.table("password_reset_tokens") \
+        .delete() \
+        .eq("token", data.token) \
+        .execute()
+
+    return {"status": "success", "message": "Password updated successfully"}
+
 # -------------------------
 # Create Booking Type API
 # -------------------------
@@ -901,41 +836,6 @@ class BookingRequest(BaseModel):
     adults: int
     children: int
     addons: list[str]   # list of addon IDs
-
-
-@app.post("/book", tags=["User"])
-def create_booking(data: BookingRequest):
-
-    people = data.adults + data.children
-
-    slot = supabase.table("time_slots") \
-        .select("capacity") \
-        .eq("id", data.time_slot_id) \
-        .execute().data[0]
-
-    # Convert date to ISO format string for database operations
-    visit_date_str = data.visit_date.isoformat() if isinstance(data.visit_date, date) else str(data.visit_date)
-    
-    booked = supabase.table("bookings") \
-        .select("adults,children") \
-        .eq("time_slot_id", data.time_slot_id) \
-        .eq("visit_date", visit_date_str) \
-        .execute().data
-
-    used = sum([b["adults"] + b["children"] for b in booked])
-
-    if used + people > slot["capacity"]:
-        raise HTTPException(status_code=400, detail="Slot is full")
-
-    # proceed booking
-    return supabase.table("bookings").insert({
-        "user_id": data.user_id,
-        "booking_type_id": data.booking_type_id,
-        "time_slot_id": data.time_slot_id,
-        "visit_date": visit_date_str,  # Convert date to string for JSON serialization
-        "adults": data.adults,
-        "children": data.children
-    }).execute()
 
 # -------------------------
 # Admin Addons API
@@ -1132,17 +1032,6 @@ def create_booking(data: BookingRequest):
     return booking
 
 # -------------------------
-# Admin Cancel Booking API
-# -------------------------
-@app.post("/admin/cancel-booking/{booking_id}", tags=["Admin"])
-def cancel_booking(booking_id: str):
-    # Use admin client to bypass RLS policies
-    return supabase_admin.table("bookings") \
-        .update({"status": "cancelled"}) \
-        .eq("id", booking_id) \
-        .execute()
-
-# -------------------------
 # User Cancel Booking API
 # -------------------------
 @app.post("/cancel-booking/{booking_id}", tags=["User"])
@@ -1248,6 +1137,7 @@ def cancel_email_template(booking, user):
 # -------------------------
 # Admin Cancel Booking API
 # -------------------------    
+
 @app.post("/admin/cancel-booking/{booking_id}", tags=["Admin"])
 def cancel_booking(booking_id: str):
 
