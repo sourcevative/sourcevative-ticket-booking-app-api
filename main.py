@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
+from pydantic import Field
 import re
 from supabase import create_client
 from dotenv import load_dotenv
@@ -94,7 +95,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         }
     )
 
-
 # -------------------------
 # Request Body
 # -------------------------
@@ -145,11 +145,6 @@ class DirectResetRequest(BaseModel):
                 "new_password": "newSecurePassword123"
             }
         }
-
-class ResetPasswordRequest(BaseModel):
-    access_token: str
-    new_password: str
-
 
 # -------------------------
 # Email and SMS Helper Functions
@@ -739,25 +734,31 @@ def reset_password(data: ResetPasswordRequest):
 # -------------------------
 class BookingTypeRequest(BaseModel):
     name: str
+    description: str
     adult_price: float
     child_price: float
+    total_capacity: int = Field(gt=0, description="Max people per day")
     admin_id: str
 
 @app.post("/admin/booking-type", tags=["Admin"])
 def create_booking_type(data: BookingTypeRequest):
     # Use admin client to bypass RLS policies
     return supabase_admin.table("booking_types").insert({
-        "name": data.name,
-        "adult_price": data.adult_price,
-        "child_price": data.child_price,
-        "created_by": data.admin_id
-    }).execute()
+    "name": data.name,
+    "description": data.description,
+    "adult_price": data.adult_price,
+    "child_price": data.child_price,
+    "total_capacity": data.total_capacity,
+    "created_by": data.admin_id
+}).execute()
 
-@app.get("/admin/booking-types", tags=["Admin"])
-def get_admin_booking_types():
-    # Use admin client to bypass RLS policies
-    return supabase_admin.table("booking_types") \
-        .select("id, name, adult_price, child_price, profiles(name,email)") \
+@app.get("/booking-types", tags=["User"])
+def get_booking_types():
+    return supabase.table("booking_types") \
+        .select(
+            "id, name, description, adult_price, child_price, total_capacity"
+        ) \
+        .eq("is_active", True) \
         .execute()
 
 
@@ -766,16 +767,6 @@ class TimeSlotRequest(BaseModel):
     start_time: str
     end_time: str
     capacity: int
-
-@app.post("/admin/time-slot", tags=["Admin"])
-def create_time_slot(data: TimeSlotRequest):
-    # Use admin client to bypass RLS policies
-    return supabase_admin.table("time_slots").insert({
-        "booking_type_id": data.booking_type_id,
-        "start_time": data.start_time,
-        "end_time": data.end_time,
-        "capacity": data.capacity
-    }).execute()
 
 @app.get("/booking-types", tags=["User"])
 def get_booking_types():
@@ -793,25 +784,49 @@ def get_time_slots(booking_type_id: str):
         .execute()
 
 # -------------------------
+# Create Time Slot API
+# -------------------------
+@app.post("/admin/time-slot", tags=["Admin"])
+def create_time_slot(data: TimeSlotRequest):
+    # Use admin client to bypass RLS policies
+    return supabase_admin.table("time_slots").insert({
+        "booking_type_id": data.booking_type_id,
+        "start_time": data.start_time,
+        "end_time": data.end_time,
+        "capacity": data.capacity
+    }).execute()
+
+# -------------------------
 # Admin Update Booking Type API
 # -------------------------
 class UpdateBookingTypeRequest(BaseModel):
     name: str
+    description: str
     adult_price: float
     child_price: float
+    total_capacity: int = Field(gt=0)
     is_active: bool
 
 @app.put("/admin/booking-type/{booking_type_id}", tags=["Admin"])
 def update_booking_type(booking_type_id: str, data: UpdateBookingTypeRequest):
-    # Use admin client to bypass RLS policies
     return supabase_admin.table("booking_types") \
         .update({
             "name": data.name,
+            "description": data.description,
             "adult_price": data.adult_price,
             "child_price": data.child_price,
+            "total_capacity": data.total_capacity,
             "is_active": data.is_active
         }) \
         .eq("id", booking_type_id) \
+        .execute()
+
+@app.get("/admin/booking-types", tags=["Admin"])
+def get_admin_booking_types():
+    return supabase_admin.table("booking_types") \
+        .select(
+            "id, name, description, adult_price, child_price, total_capacity, is_active"
+        ) \
         .execute()
 
 # -------------------------
@@ -833,9 +848,18 @@ class BookingRequest(BaseModel):
     booking_type_id: str
     time_slot_id: str
     visit_date: date
+
     adults: int
     children: int
-    addons: list[str]   # list of addon IDs
+    addons: list[str] = []
+
+    contact_name: str
+    contact_email: str
+    contact_phone: str
+
+    preferred_contact: str | None = "email"
+    notes: str | None = None
+
 
 # -------------------------
 # Admin Addons API
@@ -858,6 +882,7 @@ class PriceRequest(BaseModel):
     adults: int
     children: int
     addons: list[str]
+
 # -------------------------
 # User Add Addons to Booking API
 # -------------------------
@@ -934,11 +959,6 @@ def calculate_price(data: PriceRequest):
     
     # Warn if booking type is inactive (but still allow price calculation)
     if not bt.get("is_active", True):
-        # You can uncomment this to prevent price calculation for inactive types
-        # raise HTTPException(
-        #     status_code=400,
-        #     detail=f"Booking type '{bt.get('name', 'Unknown')}' is currently inactive"
-        # )
         pass
 
     base = (data.adults * bt["adult_price"]) + (data.children * bt["child_price"])
@@ -976,80 +996,84 @@ def calculate_price(data: PriceRequest):
 # -------------------------
 @app.post("/book", tags=["User"])
 def create_booking(data: BookingRequest):
-
-    # capacity check code stays here
-    # Convert date to ISO format string for database operations
-    visit_date_str = data.visit_date.isoformat() if isinstance(data.visit_date, date) else str(data.visit_date)
-
-    booking = supabase.table("bookings").insert({
-        "user_id": data.user_id,
-        "booking_type_id": data.booking_type_id,
-        "time_slot_id": data.time_slot_id,
-        "visit_date": visit_date_str,  # Convert date to string for JSON serialization
-        "adults": data.adults,
-        "children": data.children,
-        "contact_name": data.contact_name,
-        "contact_email": data.contact_email,
-        "contact_phone": data.contact_phone,
-        "preferred_contact": data.preferred_contact,
-        "notes": data.notes
-    }).execute()
-
-    booking_id = booking.data[0]["id"]
-
-    for addon_id in data.addons:
-        supabase.table("booking_addons").insert({
-            "booking_id": booking_id,
-            "addon_id": addon_id
+    try:
+        booking_res = supabase.table("bookings").insert({
+            "user_id": data.user_id,
+            "booking_type_id": data.booking_type_id,
+            "time_slot_id": data.time_slot_id,
+            "visit_date": data.visit_date.isoformat(),
+            "adults": data.adults,
+            "children": data.children,
+            "status": "confirmed",          # ✅ direct confirm
+            "payment_method": "cash",       # ✅ fixed
+            "contact_name": data.contact_name,
+            "contact_email": data.contact_email,
+            "contact_phone": data.contact_phone,
+            "preferred_contact": data.preferred_contact,
+            "notes": data.notes
         }).execute()
 
-    return booking
+        booking = booking_res.data[0]
 
-    booking_id = booking.data[0]["id"]
+        # Add addons
+        for addon_id in data.addons:
+            supabase.table("booking_addons").insert({
+                "booking_id": booking["id"],
+                "addon_id": addon_id
+            }).execute()
 
-    for addon_id in data.addons:
-        supabase.table("booking_addons").insert({
-            "booking_id": booking_id,
-            "addon_id": addon_id
-        }).execute()
+        # Send confirmation email
+        email_body = booking_email_template(data, booking)
+        send_email(data.contact_email, "Booking Confirmed", email_body)
 
-    # 🔹 Get login user's email
-    user = supabase.table("profiles") \
-        .select("email") \
-        .eq("id", data.user_id) \
-        .execute().data[0]
+        return {
+            "status": "success",
+            "booking_id": booking["id"],
+            "payment_method": "cash",
+            "message": "Booking confirmed. Please pay at the counter."
+        }
 
-    # 🔹 Prepare email
-    email_body = booking_email_template(data, booking.data[0])
-
-    # 🔹 Send to contact email
-    send_email(data.contact_email, "Your Booking Confirmation", email_body)
-
-    # 🔹 Send to login email if different
-    if user["email"] != data.contact_email:
-        send_email(user["email"], "Your Booking Confirmation", email_body)
-
-    return booking
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------
-# User Cancel Booking API
+# Cash-received Bookings API
 # -------------------------
-@app.post("/cancel-booking/{booking_id}", tags=["User"])
-def user_cancel_booking(booking_id: str, user_id: str):
+@app.post("/admin/booking/{booking_id}/cash-received", tags=["Admin"])
+def mark_cash_received(booking_id: str):
 
-    # check booking belongs to user
-    booking = supabase.table("bookings") \
-        .select("user_id") \
+    # 1️⃣ Get booking details
+    booking_res = supabase_admin.table("bookings") \
+        .select("id, contact_name, contact_email, visit_date, total_amount, payment_received") \
         .eq("id", booking_id) \
         .execute()
 
-    if booking.data[0]["user_id"] != user_id:
-        raise HTTPException(status_code=403, detail="Not allowed")
+    if not booking_res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
 
-    return supabase.table("bookings") \
-        .update({"status": "cancelled"}) \
+    booking = booking_res.data[0]
+
+    if booking["payment_received"]:
+        return {
+            "status": "already_done",
+            "message": "Payment already marked as received"
+        }
+
+    # 2️⃣ Mark payment as received
+    supabase_admin.table("bookings") \
+        .update({"payment_received": True}) \
         .eq("id", booking_id) \
         .execute()
+
+    # 3️⃣ Send payment received email
+    email_body = payment_received_email_template(booking)
+    send_email(booking["contact_email"], "Payment Received - Animal Farm", email_body)
+
+    return {
+        "status": "success",
+        "message": "Cash marked as received and email sent"
+    }
+
 
 # -------------------------
 # Admin Show User Bookings API
@@ -1111,15 +1135,46 @@ def send_email(to_email, subject, body):
     server.send_message(msg)
     server.quit()
 
+
+def send_email(to_email: str, subject: str, body: str):
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        print("⚠️ Email credentials missing, skipping email")
+        return
+
+    msg = MIMEText(body, "html")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = to_email
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+
+# -------------------------
+# Booking Done Email Template API
+# -------------------------
 def booking_email_template(data, booking):
     return f"""
     <h2>Booking Confirmed 🎉</h2>
+
     <p><b>Name:</b> {data.contact_name}</p>
     <p><b>Visit Date:</b> {data.visit_date}</p>
-    <p><b>Adults:</b> {data.adults} | <b>Children:</b> {data.children}</p>
+    <p><b>Adults:</b> {data.adults}</p>
+    <p><b>Children:</b> {data.children}</p>
+
+    <hr/>
+
+    <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
+    <p><b>Payment Method:</b> Cash (Pay at counter)</p>
+
     <p><b>Booking ID:</b> {booking['id']}</p>
-    <p>Thank you for booking with Animal Farm!</p>
+
+    <br/>
+    <p>Please pay the above amount at the counter.</p>
+    <p>Thank you for booking with <b>Animal Farm</b> 🐄🌿</p>
     """
+
 
 # -------------------------
 # Cancel Booking Email Template API
@@ -1166,19 +1221,26 @@ def cancel_booking(booking_id: str):
 @app.post("/cancel-booking/{booking_id}", tags=["User"])
 def user_cancel_booking(booking_id: str, user_id: str):
 
-    booking = supabase.table("bookings") \
+    booking_res = supabase.table("bookings") \
         .select("*, profiles(email)") \
         .eq("id", booking_id) \
-        .execute().data[0]
+        .execute()
+
+    if not booking_res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking = booking_res.data[0]
 
     if booking["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Not allowed")
 
+    # Update status
     supabase.table("bookings") \
         .update({"status": "cancelled"}) \
         .eq("id", booking_id) \
         .execute()
 
+    # Send emails
     email_body = cancel_email_template(booking, booking["profiles"])
 
     send_email(booking["contact_email"], "Booking Cancelled", email_body)
@@ -1186,7 +1248,11 @@ def user_cancel_booking(booking_id: str, user_id: str):
     if booking["profiles"]["email"] != booking["contact_email"]:
         send_email(booking["profiles"]["email"], "Booking Cancelled", email_body)
 
-    return {"status": "cancelled"}
+    return {
+        "status": "success",
+        "message": "Booking cancelled successfully"
+    }
+
 
 # -------------------------
 # Calculate Refund API
@@ -1215,36 +1281,45 @@ def calculate_refund(booking):
 @app.get("/admin/revenue", tags=["Admin"])
 def get_revenue():
 
-    confirmed = supabase.table("bookings") \
+    cash_received = supabase.table("bookings") \
         .select("total_amount") \
-        .eq("status", "confirmed") \
+        .eq("payment_received", True) \
         .execute().data
 
-    cancelled = supabase.table("bookings") \
-        .select("cancellation_fee") \
-        .eq("status", "cancelled") \
-        .execute().data
-
-    confirmed_total = sum(b["total_amount"] or 0 for b in confirmed)
-    cancelled_total = sum(b["cancellation_fee"] or 0 for b in cancelled)
+    total_revenue = sum(b["total_amount"] or 0 for b in cash_received)
 
     return {
-        "booking_revenue": confirmed_total,
-        "cancellation_revenue": cancelled_total,
-        "total_revenue": confirmed_total + cancelled_total
+        "cash_received_revenue": total_revenue,
+        "bookings_count": len(cash_received)
     }
 
 # -------------------------
-# Revenue Stats API
+# Cash Revenue API
 # ------------------------- 
-@app.get("/admin/revenue-stats", tags=["Admin"])
-def revenue_stats():
+@app.get("/admin/cash-revenue", tags=["Admin"])
+def cash_revenue():
+
+    now = datetime.utcnow()
+
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=today_start.weekday())
+    month_start = today_start.replace(day=1)
+    year_start = today_start.replace(month=1, day=1)
+
+    def sum_cash(from_date):
+        rows = supabase_admin.table("bookings") \
+            .select("total_amount") \
+            .eq("payment_received", True) \
+            .gte("created_at", from_date.isoformat()) \
+            .execute().data
+
+        return sum(r["total_amount"] or 0 for r in rows)
 
     return {
-        "today": supabase.rpc("revenue_today").execute().data,
-        "this_week": supabase.rpc("revenue_week").execute().data,
-        "this_month": supabase.rpc("revenue_month").execute().data,
-        "this_year": supabase.rpc("revenue_year").execute().data
+        "today": sum_cash(today_start),
+        "this_week": sum_cash(week_start),
+        "this_month": sum_cash(month_start),
+        "this_year": sum_cash(year_start)
     }
 
 # -------------------------
@@ -1255,28 +1330,97 @@ def download_receipt(booking_id: str):
 
     booking = supabase.table("bookings") \
         .select(
-            "id, visit_date, adults, children, total_amount, status, contact_name, booking_types(name), time_slots(start_time,end_time)"
+            """
+            id,
+            visit_date,
+            adults,
+            children,
+            total_amount,
+            payment_method,
+            payment_received,
+            contact_name,
+            booking_types(name),
+            time_slots(start_time,end_time)
+            """
         ) \
         .eq("id", booking_id) \
         .execute().data[0]
 
-    # ✅ Windows-safe folder
     os.makedirs("receipts", exist_ok=True)
-
     filename = f"receipts/receipt_{booking_id}.pdf"
+
     c = canvas.Canvas(filename, pagesize=A4)
 
-    c.drawString(50, 800, "Animal Farm Booking Receipt")
-    c.drawString(50, 770, f"Booking ID: {booking['id']}")
-    c.drawString(50, 750, f"Name: {booking['contact_name']}")
-    c.drawString(50, 730, f"Visit Date: {booking['visit_date']}")
-    c.drawString(50, 710, f"Booking Type: {booking['booking_types']['name']}")
-    c.drawString(50, 690, f"Time Slot: {booking['time_slots']['start_time']} - {booking['time_slots']['end_time']}")
-    c.drawString(50, 670, f"Adults: {booking['adults']}")
-    c.drawString(50, 650, f"Children: {booking['children']}")
-    c.drawString(50, 630, f"Total Paid: ₹{booking['total_amount']}")
+    # Header
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, 800, "Animal Farm - Booking Receipt")
 
-    c.drawString(50, 580, "Thank you for booking with Animal Farm!")
+    c.setFont("Helvetica", 10)
+    c.drawString(50, 780, f"Booking ID: {booking['id']}")
+
+    # Body
+    y = 740
+    c.setFont("Helvetica", 11)
+
+    c.drawString(50, y, f"Name: {booking['contact_name']}")
+    y -= 20
+    c.drawString(50, y, f"Visit Date: {booking['visit_date']}")
+    y -= 20
+    c.drawString(50, y, f"Booking Type: {booking['booking_types']['name']}")
+    y -= 20
+    c.drawString(50, y, f"Time Slot: {booking['time_slots']['start_time']} - {booking['time_slots']['end_time']}")
+    y -= 20
+    c.drawString(50, y, f"Adults: {booking['adults']}")
+    y -= 20
+    c.drawString(50, y, f"Children: {booking['children']}")
+
+    # Divider
+    y -= 30
+    c.line(50, y, 550, y)
+    y -= 30
+
+    # Amount Section
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, f"Total Amount: ₹{booking['total_amount']}")
+
+    y -= 25
+    c.setFont("Helvetica", 11)
+    c.drawString(
+        50,
+        y,
+        f"Payment Method: Cash"
+    )
+
+    y -= 20
+    payment_status = "PAID" if booking["payment_received"] else "PAY AT COUNTER"
+    c.drawString(50, y, f"Payment Status: {payment_status}")
+
+    # Footer
+    y -= 40
+    c.setFont("Helvetica", 10)
+    c.drawString(50, y, "Thank you for booking with Animal Farm!")
+    y -= 15
+    c.drawString(50, y, "We look forward to welcoming you")
+
     c.save()
 
     return FileResponse(filename, filename=f"receipt_{booking_id}.pdf")
+
+# -------------------------
+# Payment Received email Receipt API
+# ------------------------- 
+def payment_received_email_template(booking):
+    return f"""
+    <h2>Payment Received ✅</h2>
+    <p>Dear {booking['contact_name']},</p>
+
+    <p>We have successfully received your cash payment.</p>
+
+    <p><b>Booking ID:</b> {booking['id']}</p>
+    <p><b>Visit Date:</b> {booking['visit_date']}</p>
+    <p><b>Total Amount Paid:</b> ₹{booking['total_amount']}</p>
+
+    <br/>
+    <p>Thank you for visiting <b>Animal Farm</b></p>
+    <p>We look forward to welcoming you!</p>
+    """
