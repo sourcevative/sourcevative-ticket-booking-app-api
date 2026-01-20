@@ -1,17 +1,15 @@
-# Python
-__pycache__/
-*.pyc
-
 # Virtual environment
 venv/
 
 # Environment variables
 .env
 
-# Receipts
-receipts/
-*.pdf
+# Python cache
+__pycache__/
+*.pyc
 
-# IDE
-.vscode/
-.idea/
+# Logs
+*.log
+
+receipts/
+

@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import Body
 from datetime import datetime, timedelta
 from datetime import datetime, date
+from datetime import datetime, timezone
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -24,6 +25,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 import uuid
 from fastapi import Header
+from typing import Optional
 
 
 load_dotenv()
@@ -94,6 +96,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "detail": "; ".join(error_details) if error_details else "Invalid request data"
         }
     )
+
+@app.get("/")
+def root():
+    return {
+        "status": "success",
+        "message": "Animal Farm API is running",
+        "docs": "/docs",
+        "health": "OK"
+    }
 
 # -------------------------
 # Request Body
@@ -648,9 +659,9 @@ def forgot_password(data: ForgotPasswordRequest):
 
     # 1. Find user
     if "@" in data.login:
-        res = supabase.table("profiles").select("id, email").eq("email", data.login).execute()
+        res = supabase_admin.table("profiles").select("id, email").eq("email", data.login).execute()
     else:
-        res = supabase.table("profiles").select("id, email").eq("phone", data.login).execute()
+        res = supabase_admin.table("profiles").select("id, email").eq("phone", data.login).execute()
 
     if not res.data:
         # Don't reveal if account exists (security)
@@ -664,7 +675,7 @@ def forgot_password(data: ForgotPasswordRequest):
     expires_at = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
 
     # 3. Store token
-    supabase.table("password_reset_tokens").insert({
+    supabase_admin.table("password_reset_tokens").insert({
         "user_id": user["id"],
         "token": token,
         "expires_at": expires_at
@@ -693,42 +704,79 @@ class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
 
+
 @app.post("/reset-password", tags=["Authentication"])
 def reset_password(data: ResetPasswordRequest):
 
-    if len(data.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    try:
+        # Validate input
+        if not data.token or not data.new_password:
+            raise HTTPException(status_code=400, detail="Token and password are required")
 
-    # 1. Find token
-    token_row = supabase.table("password_reset_tokens") \
-        .select("*") \
-        .eq("token", data.token) \
-        .execute()
+        if len(data.new_password) < 6:
+            raise HTTPException(
+                status_code=400,
+                detail="Password must be at least 6 characters long"
+            )
 
-    if not token_row.data:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+        # 🔍 Find valid token
+        token_res = (
+            supabase
+            .table("password_reset_tokens")
+            .select("id, user_id, expires_at, used")
+            .eq("token", data.token)
+            .execute()
+        )
 
-    token_data = token_row.data[0]
+        if not token_res.data:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or expired reset token"
+            )
 
-    # 2. Check expiry
-    if datetime.fromisoformat(token_data["expires_at"]) < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Reset link expired")
+        token_row = token_res.data[0]
 
-    user_id = token_data["user_id"]
+        # Check if already used
+        if token_row["used"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Reset link already used"
+            )
 
-    # 3. Update password
-    supabase.auth.admin.update_user_by_id(user_id, {
-        "password": data.new_password
-    })
+        # Check expiry
+        if datetime.now(timezone.utc) > datetime.fromisoformat(token_row["expires_at"]):
+            raise HTTPException(
+                status_code=400,
+                detail="Reset link has expired"
+            )
 
-    # 4. Delete token (one-time use)
-    supabase.table("password_reset_tokens") \
-        .delete() \
-        .eq("token", data.token) \
-        .execute()
+        user_id = token_row["user_id"]
 
-    return {"status": "success", "message": "Password updated successfully"}
+        # 🔐 Update password (ADMIN API → service role key REQUIRED)
+        supabase.auth.admin.update_user_by_id(
+            user_id,
+            {"password": data.new_password}
+        )
 
+        # ✅ Mark token as used
+        supabase.table("password_reset_tokens").update(
+            {"used": True}
+        ).eq("id", token_row["id"]).execute()
+
+        return {
+            "status": "success",
+            "message": "Password reset successful. You can now login."
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print("RESET PASSWORD ERROR 👉", e)
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to reset password. Please try again."
+        )
 # -------------------------
 # Create Booking Type API
 # -------------------------
@@ -752,6 +800,82 @@ def create_booking_type(data: BookingTypeRequest):
     "created_by": data.admin_id
 }).execute()
 
+# -------------------------
+# Edit Booking Type API
+# -------------------------
+class PartialUpdateBookingTypeRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    adult_price: Optional[float] = None
+    child_price: Optional[float] = None
+    total_capacity: Optional[int] = Field(default=None, gt=0)
+    is_active: Optional[bool] = None
+
+
+@app.patch("/admin/booking-type/{booking_type_id}", tags=["Admin"])
+def partial_update_booking_type(
+    booking_type_id: str,
+    data: PartialUpdateBookingTypeRequest
+):
+    # 1️⃣ Existing booking type fetch करा
+    existing_res = (
+        supabase_admin
+        .table("booking_types")
+        .select("*")
+        .eq("id", booking_type_id)
+        .execute()
+    )
+
+    if not existing_res.data:
+        raise HTTPException(status_code=404, detail="Booking type not found")
+
+    existing = existing_res.data[0]
+
+    # 2️⃣ Incoming data
+    incoming = data.dict(exclude_unset=True)
+
+    update_data = {}
+
+    # 3️⃣ Compare each field
+    for field, new_value in incoming.items():
+
+        # empty string ignore
+        if isinstance(new_value, str) and new_value.strip() == "":
+            continue
+
+        # None ignore
+        if new_value is None:
+            continue
+
+        old_value = existing.get(field)
+
+        # 4️⃣ Only update if value is actually changed
+        if new_value != old_value:
+            update_data[field] = new_value
+
+    if not update_data:
+        return {
+            "status": "success",
+            "message": "No changes detected"
+        }
+
+    # 5️⃣ Update only changed fields
+    supabase_admin.table("booking_types") \
+        .update(update_data) \
+        .eq("id", booking_type_id) \
+        .execute()
+
+    return {
+        "status": "success",
+        "message": "Booking type updated successfully",
+        "updated_fields": list(update_data.keys())
+    }
+
+
+
+# -------------------------
+# Create Time Slot API
+# -------------------------
 @app.get("/booking-types", tags=["User"])
 def get_booking_types():
     return supabase.table("booking_types") \
@@ -768,12 +892,6 @@ class TimeSlotRequest(BaseModel):
     end_time: str
     capacity: int
 
-@app.get("/booking-types", tags=["User"])
-def get_booking_types():
-    return supabase.table("booking_types") \
-        .select("*") \
-        .eq("is_active", True) \
-        .execute()
 
 @app.get("/time-slots/{booking_type_id}", tags=["User"])
 def get_time_slots(booking_type_id: str):
@@ -820,7 +938,9 @@ def update_booking_type(booking_type_id: str, data: UpdateBookingTypeRequest):
         }) \
         .eq("id", booking_type_id) \
         .execute()
-
+# -------------------------
+# Create Time Slot API
+# -------------------------
 @app.get("/admin/booking-types", tags=["Admin"])
 def get_admin_booking_types():
     return supabase_admin.table("booking_types") \
@@ -864,24 +984,121 @@ class BookingRequest(BaseModel):
 # -------------------------
 # Admin Addons API
 # -------------------------
+class PriceRequest(BaseModel):
+    booking_type_id: str
+    adults: int
+    children: int
+    addons: list[str] 
+
+class UpdateAddonRequest(BaseModel):
+    price: Optional[float] = Field(None, gt=0)
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    is_active: Optional[bool] = None 
+
+
 @app.post("/admin/addon", tags=["Admin"])
 def create_addon(name: str, description: str, price: float):
     # Use admin client to bypass RLS policies
     return supabase_admin.table("addons").insert({
         "name": name,
         "description": description,
-        "price": price
+        "price": price,
+        "is_active": True 
     }).execute()
+
 
 @app.get("/addons", tags=["User"])
 def get_addons():
-    return supabase.table("addons").select("*").eq("is_active", True).execute()
+    return supabase.table("addons") \
+        .select("*") \
+        .eq("is_active", True) \
+        .execute()
 
-class PriceRequest(BaseModel):
-    booking_type_id: str
-    adults: int
-    children: int
-    addons: list[str]
+
+@app.patch("/admin/addon/{addon_id}/toggle", tags=["Admin"])
+def toggle_addon(addon_id: str, is_active: bool):
+
+    addon = supabase_admin.table("addons") \
+        .select("id") \
+        .eq("id", addon_id) \
+        .execute()
+
+    if not addon.data:
+        raise HTTPException(status_code=404, detail="Addon not found")
+
+    supabase_admin.table("addons") \
+        .update({"is_active": is_active}) \
+        .eq("id", addon_id) \
+        .execute()
+
+    return {
+        "status": "success",
+        "message": f"Addon {'activated' if is_active else 'deactivated'}"
+    }
+
+# -------------------------
+# Admin Edit Addons perticular field API
+# ------------------------- 
+@app.patch("/admin/addon/{addon_id}", tags=["Admin"])
+def update_addon(addon_id: str, data: UpdateAddonRequest):
+
+    # 1️⃣ Existing addon fetch
+    existing_res = (
+        supabase_admin
+        .table("addons")
+        .select("*")
+        .eq("id", addon_id)
+        .execute()
+    )
+
+    if not existing_res.data:
+        raise HTTPException(status_code=404, detail="Addon not found")
+
+    existing = existing_res.data[0]
+
+    # 2️⃣ Incoming data (only fields sent)
+    incoming = data.dict(exclude_unset=True)
+
+    update_data = {}
+
+    # 3️⃣ Compare field by field
+    for field, new_value in incoming.items():
+
+        # ignore None
+        if new_value is None:
+            continue
+
+        # ignore empty strings
+        if isinstance(new_value, str) and new_value.strip() == "":
+            continue
+
+        old_value = existing.get(field)
+
+        # 4️⃣ Update only if value actually changed
+        if new_value != old_value:
+            update_data[field] = new_value
+
+    # 5️⃣ Nothing changed
+    if not update_data:
+        return {
+            "status": "success",
+            "message": "No changes detected"
+        }
+
+    # 6️⃣ Update only changed fields
+    supabase_admin.table("addons") \
+        .update(update_data) \
+        .eq("id", addon_id) \
+        .execute()
+
+    return {
+        "status": "success",
+        "message": "Addon updated successfully",
+        "updated_fields": list(update_data.keys())
+    }
+
 
 # -------------------------
 # User Add Addons to Booking API
@@ -938,15 +1155,51 @@ def add_addons_to_booking(data: BookingAddonRequest):
 
 # -------------------------
 # User Calculate Price API
-# -------------------------   
+# -------------------------  
+# 
+def calculate_price_internal(
+    booking_type_id: str,
+    adults: int,
+    children: int,
+    addons: list[str]
+) -> dict:
+
+    booking_type_result = supabase.table("booking_types") \
+        .select("adult_price, child_price") \
+        .eq("id", booking_type_id) \
+        .execute()
+
+    if not booking_type_result.data:
+        raise HTTPException(status_code=404, detail="Booking type not found")
+
+    bt = booking_type_result.data[0]
+
+    base = (adults * bt["adult_price"]) + (children * bt["child_price"])
+
+    addon_total = 0
+    if addons:
+        addons_result = supabase.table("addons") \
+            .select("id, price") \
+            .in_("id", addons) \
+            .eq("is_active", True) \
+            .execute()
+
+        addon_total = sum(a["price"] for a in addons_result.data)
+
+    return {
+        "base_price": base,
+        "addon_total": addon_total,
+        "total": base + addon_total
+    }
+ 
 @app.post("/calculate-price", tags=["User"])
 def calculate_price(data: PriceRequest):
-
-    # Get booking type prices (check both active and inactive for price calculation)
-    booking_type_result = supabase.table("booking_types") \
-        .select("id, adult_price, child_price, is_active, name") \
-        .eq("id", data.booking_type_id) \
-        .execute()
+    return calculate_price_internal(
+        data.booking_type_id,
+        data.adults,
+        data.children,
+        data.addons
+    )
     
     # Validate that booking type exists
     if not booking_type_result.data:
@@ -996,45 +1249,52 @@ def calculate_price(data: PriceRequest):
 # -------------------------
 @app.post("/book", tags=["User"])
 def create_booking(data: BookingRequest):
+
+    # 💰 Calculate price FIRST
+    price = calculate_price_internal(
+        data.booking_type_id,
+        data.adults,
+        data.children,
+        data.addons
+    )
+
+    total_amount = price["total"]
+
     try:
-        booking_res = supabase.table("bookings").insert({
-            "user_id": data.user_id,
-            "booking_type_id": data.booking_type_id,
-            "time_slot_id": data.time_slot_id,
-            "visit_date": data.visit_date.isoformat(),
-            "adults": data.adults,
-            "children": data.children,
-            "status": "confirmed",          # ✅ direct confirm
-            "payment_method": "cash",       # ✅ fixed
-            "contact_name": data.contact_name,
-            "contact_email": data.contact_email,
-            "contact_phone": data.contact_phone,
-            "preferred_contact": data.preferred_contact,
-            "notes": data.notes
-        }).execute()
+        res = supabase_admin.rpc(
+            "create_booking_safe",
+            {
+                "p_user_id": data.user_id,
+                "p_booking_type_id": data.booking_type_id,
+                "p_time_slot_id": data.time_slot_id,
+                "p_visit_date": data.visit_date.isoformat(),
+                "p_adults": data.adults,
+                "p_children": data.children,
+                "p_total_amount": total_amount,   # ✅ HERE
+                "p_contact_name": data.contact_name,
+                "p_contact_email": data.contact_email,
+                "p_contact_phone": data.contact_phone,
+                "p_preferred_contact": data.preferred_contact,
+                "p_notes": data.notes
+            }
+        ).execute()
 
-        booking = booking_res.data[0]
-
-        # Add addons
-        for addon_id in data.addons:
-            supabase.table("booking_addons").insert({
-                "booking_id": booking["id"],
-                "addon_id": addon_id
-            }).execute()
-
-        # Send confirmation email
-        email_body = booking_email_template(data, booking)
-        send_email(data.contact_email, "Booking Confirmed", email_body)
+        booking_id = res.data
 
         return {
             "status": "success",
-            "booking_id": booking["id"],
-            "payment_method": "cash",
-            "message": "Booking confirmed. Please pay at the counter."
+            "booking_id": booking_id,
+            "total_amount": total_amount,
+            "message": "Booking confirmed"
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+
+        if "Slot full" in error_msg:
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        raise HTTPException(status_code=500, detail="Unable to create booking")
 
 # -------------------------
 # Cash-received Bookings API
