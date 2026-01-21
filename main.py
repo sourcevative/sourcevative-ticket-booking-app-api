@@ -1099,6 +1099,25 @@ def update_addon(addon_id: str, data: UpdateAddonRequest):
         "updated_fields": list(update_data.keys())
     }
 
+# -------------------------
+# Counter Booking API
+# ------------------------- 
+@app.post("/admin/book-walkin", tags=["Admin"])
+def admin_book_walkin(data: BookingRequest):
+
+    # 1. create fake user / walkin user
+    user = supabase_admin.table("walkin_customers").insert({
+        "name": data.contact_name,
+        "phone": data.contact_phone,
+        "email": data.contact_email
+    }).execute().data[0]
+
+    # 2. create booking using same RPC
+    res = supabase_admin.rpc("create_booking_safe", {
+        "p_user_id": user["id"],   # fake user
+    }).execute()
+
+    return {"status": "success"}
 
 # -------------------------
 # User Add Addons to Booking API
@@ -1333,6 +1352,7 @@ def mark_cash_received(booking_id: str):
         "message": "Cash marked as received and email sent"
     }
 
+
 # -------------------------
 # Admin Show User Bookings API
 # -------------------------
@@ -1407,7 +1427,7 @@ def send_email(to_email: str, subject: str, body: str):
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.send_message(msg)
+        server.send_message(msg)  
 
 # -------------------------
 # Booking Done Email Template API
@@ -1682,3 +1702,4 @@ def payment_received_email_template(booking):
     <p>Thank you for visiting <b>Animal Farm</b></p>
     <p>We look forward to welcoming you!</p>
     """
+
