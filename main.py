@@ -1156,7 +1156,6 @@ def add_addons_to_booking(data: BookingAddonRequest):
 # -------------------------
 # User Calculate Price API
 # -------------------------  
-# 
 def calculate_price_internal(
     booking_type_id: str,
     adults: int,
@@ -1333,7 +1332,6 @@ def mark_cash_received(booking_id: str):
         "status": "success",
         "message": "Cash marked as received and email sent"
     }
-
 
 # -------------------------
 # Admin Show User Bookings API
