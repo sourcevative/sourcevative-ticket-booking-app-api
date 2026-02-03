@@ -787,6 +787,7 @@ class BookingTypeRequest(BaseModel):
     child_price: float
     total_capacity: int = Field(gt=0, description="Max people per day")
     admin_id: str
+    features: list[str] =[]
 
 @app.post("/admin/booking-type", tags=["Admin"])
 def create_booking_type(data: BookingTypeRequest):
@@ -797,6 +798,7 @@ def create_booking_type(data: BookingTypeRequest):
     "adult_price": data.adult_price,
     "child_price": data.child_price,
     "total_capacity": data.total_capacity,
+    "features": data.features,
     "created_by": data.admin_id
 }).execute()
 
@@ -1265,19 +1267,89 @@ def calculate_price(data: PriceRequest):
 # -------------------------
 # Admin Show All Bookings API
 # -------------------------
+# @app.post("/book", tags=["User"])
+# def create_booking(data: BookingRequest):
+
+#     # 💰 Calculate price FIRST
+#     price = calculate_price_internal(
+#         data.booking_type_id,
+#         data.adults,
+#         data.children,
+#         data.addons
+#     )
+
+#     total_amount = price["total"]
+
+#     try:
+#         res = supabase_admin.rpc(
+#             "create_booking_safe",
+#             {
+#                 "p_user_id": data.user_id,
+#                 "p_booking_type_id": data.booking_type_id,
+#                 "p_time_slot_id": data.time_slot_id,
+#                 "p_visit_date": data.visit_date.isoformat(),
+#                 "p_adults": data.adults,
+#                 "p_children": data.children,
+#                 "p_total_amount": total_amount,   # ✅ HERE
+#                 "p_contact_name": data.contact_name,
+#                 "p_contact_email": data.contact_email,
+#                 "p_contact_phone": data.contact_phone,
+#                 "p_preferred_contact": data.preferred_contact,
+#                 "p_notes": data.notes
+#             }
+#         ).execute()
+
+#         booking_id = res.data
+
+#         return {
+#             "status": "success",
+#             "booking_id": booking_id,
+#             "total_amount": total_amount,
+#             "message": "Booking confirmed"
+#         }
+
+#     except Exception as e:
+#         error_msg = str(e)
+
+#         if "Slot full" in error_msg:
+#             raise HTTPException(status_code=400, detail=error_msg)
+
+#         raise HTTPException(status_code=500, detail="Unable to create booking")
+
 @app.post("/book", tags=["User"])
 def create_booking(data: BookingRequest):
 
-    # 💰 Calculate price FIRST
-    price = calculate_price_internal(
-        data.booking_type_id,
-        data.adults,
-        data.children,
-        data.addons
-    )
+    # 🔒 1. USER VALIDATION
+    user_res = supabase.table("profiles") \
+        .select("id") \
+        .eq("id", data.user_id) \
+        .execute()
 
-    total_amount = price["total"]
+    if not user_res.data:
+        raise HTTPException(status_code=400, detail="Invalid user")
 
+    # 🧹 2. SAFE ADDONS
+    addons = data.addons or []
+
+    # 💰 3. PRICE CALCULATION (SAFE)
+    try:
+        price = calculate_price_internal(
+            data.booking_type_id,
+            data.adults,
+            data.children,
+            addons
+        )
+    except Exception as e:
+        print("PRICE ERROR 👉", e)
+        raise HTTPException(status_code=400, detail="Invalid price data")
+
+    # 📅 4. DATE SAFETY
+    try:
+        visit_date = data.visit_date.isoformat()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid visit date")
+
+    # 🚀 5. BOOKING RPC
     try:
         res = supabase_admin.rpc(
             "create_booking_safe",
@@ -1285,10 +1357,10 @@ def create_booking(data: BookingRequest):
                 "p_user_id": data.user_id,
                 "p_booking_type_id": data.booking_type_id,
                 "p_time_slot_id": data.time_slot_id,
-                "p_visit_date": data.visit_date.isoformat(),
+                "p_visit_date": visit_date,
                 "p_adults": data.adults,
                 "p_children": data.children,
-                "p_total_amount": total_amount,   # ✅ HERE
+                "p_total_amount": price["total"],
                 "p_contact_name": data.contact_name,
                 "p_contact_email": data.contact_email,
                 "p_contact_phone": data.contact_phone,
@@ -1297,22 +1369,19 @@ def create_booking(data: BookingRequest):
             }
         ).execute()
 
-        booking_id = res.data
+        if not res.data:
+            raise Exception("RPC failed")
 
         return {
             "status": "success",
-            "booking_id": booking_id,
-            "total_amount": total_amount,
-            "message": "Booking confirmed"
+            "booking_id": res.data,
+            "total_amount": price["total"]
         }
 
     except Exception as e:
-        error_msg = str(e)
+        print("BOOKING ERROR 👉", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-        if "Slot full" in error_msg:
-            raise HTTPException(status_code=400, detail=error_msg)
-
-        raise HTTPException(status_code=500, detail="Unable to create booking")
 
 # -------------------------
 # Cash-received Bookings API
@@ -1392,7 +1461,7 @@ def my_bookings(user_id: str):
 
     return supabase.table("bookings") \
         .select(
-            "id, visit_date, status, adults, children, booking_types(name), time_slots(start_time,end_time), booking_addons(addons(name,price))"
+            "id,  visit_date,status,adults, children, total_amount,  contact_email,  contact_phone,   booking_types(name), time_slots(start_time,end_time), booking_addons(addons(name,price))"
         ) \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
