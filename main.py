@@ -26,6 +26,7 @@ from reportlab.pdfgen import canvas
 import uuid
 from fastapi import Header
 from typing import Optional
+from fastapi import Depends, Header
 
 
 load_dotenv()
@@ -48,9 +49,9 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 # SMS configuration (Twilio)
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+# TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+# TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+# TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Admin client with service role key (bypasses RLS)
@@ -61,6 +62,14 @@ app = FastAPI(
     description="Authentication system for Farm Booking",
     version="1.0"
 )
+@app.on_event("startup")
+def ensure_tables():
+    try:
+        supabase_admin.rpc("create_all_tables").execute()
+        print("✅ Tables ensured")
+    except Exception as e:
+        print("❌ Failed to ensure tables:", e)
+
 
 # Configure CORS
 app.add_middleware(
@@ -147,15 +156,15 @@ class ForgotPasswordRequest(BaseModel):
 class DirectResetRequest(BaseModel):
     user_id: str
     new_password: str
-    
+
     class Config:
-        # Better error messages for missing fields
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "user_id": "123e4567-e89b-12d3-a456-426614174000",
                 "new_password": "newSecurePassword123"
             }
         }
+
 
 # -------------------------
 # Email and SMS Helper Functions
@@ -579,24 +588,16 @@ def login_email_or_Phone_no(data: LoginRequest):
     try:
         email = data.login
 
-        # If phone number entered → find email from profiles table
         if "@" not in data.login:
             result = supabase.table("profiles").select("email").eq("phone", data.login).execute()
-
             if len(result.data) == 0:
                 raise HTTPException(status_code=400, detail="Phone number not found")
-
             email = result.data[0]["email"]
 
-        # First, verify user exists in profiles table
         profile_result = supabase.table("profiles").select("id").eq("email", email).execute()
-        
         if len(profile_result.data) == 0:
             raise HTTPException(status_code=401, detail="Invalid login credentials")
 
-        user_id = profile_result.data[0]["id"]
-
-        # Try to login with password
         try:
             auth = supabase.auth.sign_in_with_password({
                 "email": email,
@@ -607,34 +608,51 @@ def login_email_or_Phone_no(data: LoginRequest):
 
         except Exception as auth_error:
             error_str = str(auth_error).lower()
-            
-            # Handle "User not allowed" error - usually means email not confirmed
-            if "user not allowed" in error_str or "email not confirmed" in error_str or "email_address_not_authorized" in error_str:
+            if "user not allowed" in error_str or "email not confirmed" in error_str:
                 raise HTTPException(
                     status_code=401, 
-                    detail="Please verify your email address before logging in. Check your inbox for the verification link."
+                    detail="Please verify your email address before logging in."
                 )
             else:
-                # Other authentication errors (wrong password, etc.)
                 raise HTTPException(status_code=401, detail="Invalid login credentials")
 
-        # Get user profile
         profile = supabase.table("profiles").select("*").eq("id", user.id).execute()
-
         if len(profile.data) == 0:
             raise HTTPException(status_code=404, detail="User profile not found")
 
+        # ✅ RETURN MUST BE INSIDE TRY
         return {
-             "status": "success",
+            "status": "success",
             "access_token": session.access_token,
+            "refresh_token": session.refresh_token,
+            "expires_in": session.expires_in,
             "user": profile.data[0],
-            "role": profile.data[0]["role"] if "role" in profile.data[0] else "user"
+            "role": profile.data[0].get("role", "user")
         }
 
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Login error: {e}")
         raise HTTPException(status_code=401, detail="Invalid login credentials")
+
+# -------------------------
+# Refresh Token API
+# -------------------------
+@app.post("/refresh-token", tags=["Authentication"])
+def refresh_token_api(refresh_token: str = Body(..., embed=True)):
+    try:
+        session = supabase.auth.refresh_session(refresh_token)
+
+        return {
+            "status": "success",
+            "access_token": session.access_token,
+            "refresh_token": session.refresh_token,
+            "expires_in": session.expires_in
+        }
+
+    except Exception:
+        raise HTTPException(401, "Session expired. Please login again.")
 
 # -------------------------
 # Logout API
@@ -810,6 +828,8 @@ class PartialUpdateBookingTypeRequest(BaseModel):
     child_price: Optional[float] = None
     total_capacity: Optional[int] = Field(default=None, gt=0)
     is_active: Optional[bool] = None
+    features: Optional[list[str]] = None  
+
 
 
 @app.patch("/admin/booking-type/{booking_type_id}", tags=["Admin"])
@@ -871,8 +891,6 @@ def partial_update_booking_type(
         "updated_fields": list(update_data.keys())
     }
 
-
-
 # -------------------------
 # Create Time Slot API
 # -------------------------
@@ -880,7 +898,7 @@ def partial_update_booking_type(
 def get_booking_types():
     return supabase.table("booking_types") \
         .select(
-            "id, name, description, adult_price, child_price, total_capacity"
+            "id, name, description, adult_price, child_price, total_capacity, features"
         ) \
         .eq("is_active", True) \
         .execute()
@@ -960,6 +978,7 @@ def toggle_booking_type(booking_type_id: str, is_active: bool):
         .eq("id", booking_type_id) \
         .execute()
 
+
 # -------------------------
 # User Book Ticket API
 # -------------------------
@@ -989,6 +1008,7 @@ class PriceRequest(BaseModel):
     adults: int
     children: int
     addons: list[str] 
+
 
 class UpdateAddonRequest(BaseModel):
     price: Optional[float] = Field(None, gt=0)
@@ -1105,19 +1125,34 @@ def update_addon(addon_id: str, data: UpdateAddonRequest):
 @app.post("/admin/book-walkin", tags=["Admin"])
 def admin_book_walkin(data: BookingRequest):
 
-    # 1. create fake user / walkin user
-    user = supabase_admin.table("walkin_customers").insert({
-        "name": data.contact_name,
-        "phone": data.contact_phone,
-        "email": data.contact_email
-    }).execute().data[0]
+    price = calculate_price_internal(
+        data.booking_type_id,
+        data.adults,
+        data.children,
+        data.addons
+    )
 
-    # 2. create booking using same RPC
-    res = supabase_admin.rpc("create_booking_safe", {
-        "p_user_id": user["id"],   # fake user
+    res = supabase_admin.rpc("create_walkin_booking", {
+        "p_name": data.contact_name,
+        "p_phone": data.contact_phone,
+        "p_email": data.contact_email,
+        "p_booking_type_id": data.booking_type_id,
+        "p_time_slot_id": data.time_slot_id,
+        "p_visit_date": data.visit_date.isoformat(),
+        "p_adults": data.adults,
+        "p_children": data.children,
+        "p_total_amount": price["total"],
+        "p_preferred_contact": data.preferred_contact,
+        "p_notes": data.notes
     }).execute()
 
-    return {"status": "success"}
+    return {
+        "status": "success",
+        "booking_id": res.data,
+        "total_amount": price["total"],
+        "message": "Walk-in booking confirmed"
+    }
+
 
 # -------------------------
 # User Add Addons to Booking API
@@ -1401,19 +1436,6 @@ def my_bookings(user_id: str):
 # -------------------------
 # Send Email Confirmation API
 # -------------------------
-def send_email(to_email, subject, body):
-    msg = MIMEText(body, "html")
-    msg["Subject"] = subject
-    msg["From"] = os.getenv("EMAIL_USER")
-    msg["To"] = to_email
-
-    server = smtplib.SMTP(os.getenv("EMAIL_HOST"), int(os.getenv("EMAIL_PORT")))
-    server.starttls()
-    server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"))
-    server.send_message(msg)
-    server.quit()
-
-
 def send_email(to_email: str, subject: str, body: str):
     if not SMTP_EMAIL or not SMTP_PASSWORD:
         print("⚠️ Email credentials missing, skipping email")
@@ -1427,7 +1449,7 @@ def send_email(to_email: str, subject: str, body: str):
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.send_message(msg)  
+        server.send_message(msg)
 
 # -------------------------
 # Booking Done Email Template API
@@ -1495,42 +1517,53 @@ def cancel_booking(booking_id: str):
 
 # -------------------------
 # User Cancel Booking API
-# ------------------------- 
-@app.post("/cancel-booking/{booking_id}", tags=["User"])
-def user_cancel_booking(booking_id: str, user_id: str):
+# -------------------------
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization:
+        raise HTTPException(401, "Authorization header missing")
 
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Invalid auth format")
+
+    token = authorization.replace("Bearer ", "")
+    res = supabase.auth.get_user(token)
+
+    if not res or not res.user:
+        raise HTTPException(401, "Invalid or expired token")
+
+    return res.user.id
+
+
+@app.post("/cancel-booking/{booking_id}", tags=["User"])
+def user_cancel_booking(
+    booking_id: str,
+    current_user_id: str = Depends(get_current_user)
+):
     booking_res = supabase.table("bookings") \
-        .select("*, profiles(email)") \
+        .select("user_id, status") \
         .eq("id", booking_id) \
         .execute()
 
     if not booking_res.data:
-        raise HTTPException(status_code=404, detail="Booking not found")
+        raise HTTPException(404, "Booking not found")
 
     booking = booking_res.data[0]
 
-    if booking["user_id"] != user_id:
-        raise HTTPException(status_code=403, detail="Not allowed")
+    if booking["user_id"] != current_user_id:
+        raise HTTPException(403, "Not allowed")
 
-    # Update status
+    if booking["status"] == "cancelled":
+        return {"status": "already_cancelled"}
+
     supabase.table("bookings") \
         .update({"status": "cancelled"}) \
         .eq("id", booking_id) \
         .execute()
 
-    # Send emails
-    email_body = cancel_email_template(booking, booking["profiles"])
-
-    send_email(booking["contact_email"], "Booking Cancelled", email_body)
-
-    if booking["profiles"]["email"] != booking["contact_email"]:
-        send_email(booking["profiles"]["email"], "Booking Cancelled", email_body)
-
     return {
         "status": "success",
         "message": "Booking cancelled successfully"
     }
-
 
 # -------------------------
 # Calculate Refund API
@@ -1599,6 +1632,7 @@ def cash_revenue():
         "this_month": sum_cash(month_start),
         "this_year": sum_cash(year_start)
     }
+
 
 # -------------------------
 # Download Receipt API
