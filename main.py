@@ -890,6 +890,7 @@ def get_booking_types():
 
 class TimeSlotRequest(BaseModel):
     booking_type_id: str
+    slot_name: str
     start_time: str
     end_time: str
     capacity: int
@@ -898,7 +899,7 @@ class TimeSlotRequest(BaseModel):
 @app.get("/time-slots/{booking_type_id}", tags=["User"])
 def get_time_slots(booking_type_id: str):
     return supabase.table("time_slots") \
-        .select("*") \
+        .select("id, slot_name, start_time, end_time, capacity") \
         .eq("booking_type_id", booking_type_id) \
         .eq("is_active", True) \
         .execute()
@@ -911,9 +912,11 @@ def create_time_slot(data: TimeSlotRequest):
     # Use admin client to bypass RLS policies
     return supabase_admin.table("time_slots").insert({
         "booking_type_id": data.booking_type_id,
+          "slot_name": data.slot_name,
         "start_time": data.start_time,
         "end_time": data.end_time,
-        "capacity": data.capacity
+        "capacity": data.capacity,
+        "is_active": True
     }).execute()
 
 # -------------------------
@@ -1430,10 +1433,70 @@ def get_user_bookings(user_id: str):
 
     return supabase.table("bookings") \
         .select(
-            "id, visit_date, status, adults, children, booking_types(name), time_slots(start_time,end_time), booking_addons(addons(name,price))"
+            "id, visit_date, status, adults, children, booking_types(name), time_slots(slot_name,start_time,end_time), booking_addons(addons(name,price))"
         ) \
         .eq("user_id", user_id) \
         .execute()
+
+# -------------------------
+# Admin Show All Bookings API (ADMIN DASHBOARD LIST)
+# -------------------------
+@app.get("/admin/bookings", tags=["Admin"])
+def admin_all_bookings():
+
+    res = supabase_admin.table("bookings") \
+        .select("""
+            id,
+            visit_date,
+            status,
+            adults,
+            children,
+            total_amount,
+            payment_status,
+            created_at,
+            contact_name,
+            contact_email,
+            booking_types(name),
+            time_slots(slot_name,start_time,end_time)
+        """) \
+        .order("created_at", desc=True) \
+        .execute()
+
+    return res.data
+
+# -------------------------
+# Admin Single Booking Details API (View Details Modal)
+# -------------------------
+@app.get("/admin/bookings/{booking_id}", tags=["Admin"])
+def admin_booking_details(booking_id: str):
+
+    res = supabase_admin.table("bookings") \
+        .select("""
+            id,
+            visit_date,
+            status,
+            adults,
+            children,
+            total_amount,
+            payment_status,
+            payment_method,
+            contact_name,
+            contact_email,
+            contact_phone,
+            notes,
+            booking_types(name),
+            time_slots(slot_name,start_time,end_time)
+        """) \
+        .eq("id", booking_id) \
+        .single() \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    return res.data
+
+
 
 # -------------------------
 # Admin Show Stats API
@@ -1461,7 +1524,7 @@ def my_bookings(user_id: str):
 
     return supabase.table("bookings") \
         .select(
-            "id,  visit_date,status,adults, children, total_amount,  contact_email,  contact_phone,   booking_types(name), time_slots(start_time,end_time), booking_addons(addons(name,price))"
+            "id,  visit_date,status,adults, children, total_amount,  contact_email,  contact_phone,   booking_types(name), time_slots(slot_name,start_time,end_time), booking_addons(addons(name,price))"
         ) \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
@@ -1470,19 +1533,6 @@ def my_bookings(user_id: str):
 # -------------------------
 # Send Email Confirmation API
 # -------------------------
-def send_email(to_email, subject, body):
-    msg = MIMEText(body, "html")
-    msg["Subject"] = subject
-    msg["From"] = os.getenv("EMAIL_USER")
-    msg["To"] = to_email
-
-    server = smtplib.SMTP(os.getenv("EMAIL_HOST"), int(os.getenv("EMAIL_PORT")))
-    server.starttls()
-    server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"))
-    server.send_message(msg)
-    server.quit()
-
-
 def send_email(to_email: str, subject: str, body: str):
     if not SMTP_EMAIL or not SMTP_PASSWORD:
         print("⚠️ Email credentials missing, skipping email")
@@ -1507,6 +1557,8 @@ def booking_email_template(data, booking):
 
     <p><b>Name:</b> {data.contact_name}</p>
     <p><b>Visit Date:</b> {data.visit_date}</p>
+    <p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
+   ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
     <p><b>Adults:</b> {data.adults}</p>
     <p><b>Children:</b> {data.children}</p>
 
@@ -1687,7 +1739,7 @@ def download_receipt(booking_id: str):
             payment_received,
             contact_name,
             booking_types(name),
-            time_slots(start_time,end_time)
+            time_slots(slot_name,start_time,end_time)
             """
         ) \
         .eq("id", booking_id) \
@@ -1715,7 +1767,8 @@ def download_receipt(booking_id: str):
     y -= 20
     c.drawString(50, y, f"Booking Type: {booking['booking_types']['name']}")
     y -= 20
-    c.drawString(50, y, f"Time Slot: {booking['time_slots']['start_time']} - {booking['time_slots']['end_time']}")
+    # c.drawString(50, y, f"Time Slot: {booking['time_slots']['start_time']} - {booking['time_slots']['end_time']}")
+    c.drawString( 50, y, f"Time Slot: {booking['time_slots']['slot_name']} "f"({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})")
     y -= 20
     c.drawString(50, y, f"Adults: {booking['adults']}")
     y -= 20
