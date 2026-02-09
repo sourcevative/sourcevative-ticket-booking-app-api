@@ -4,30 +4,24 @@ import smtplib
 import secrets
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from fastapi import FastAPI, HTTPException, Request, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
-from pydantic import Field
 import re
 from supabase import create_client
 from dotenv import load_dotenv
 from fastapi import Body
-from datetime import datetime, timedelta
-from datetime import datetime, date
-from datetime import datetime, timezone
-import smtplib
-from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timedelta, date, timezone
 from fastapi.responses import FileResponse
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-import uuid
 from fastapi import Header
 from typing import Optional
 from fastapi import Depends, Header
-
+from fastapi import BackgroundTasks
 
 load_dotenv()
 
@@ -806,8 +800,9 @@ class BookingTypeRequest(BaseModel):
     total_capacity: int = Field(gt=0, description="Max people per day")
     admin_id: str
     features: list[str] =[]
+    icon: Optional[str] = None
 
-@app.post("/admin/booking-type", tags=["Admin"])
+@app.post("/admin/booking-type", tags=["Admin"])  
 def create_booking_type(data: BookingTypeRequest):
     # Use admin client to bypass RLS policies
     return supabase_admin.table("booking_types").insert({
@@ -817,6 +812,7 @@ def create_booking_type(data: BookingTypeRequest):
     "child_price": data.child_price,
     "total_capacity": data.total_capacity,
     "features": data.features,
+    "icon": data.icon,
     "created_by": data.admin_id
 }).execute()
 
@@ -894,13 +890,13 @@ def partial_update_booking_type(
     }
 
 # -------------------------
-# Create Time Slot API
+# Booking-types API
 # -------------------------
 @app.get("/booking-types", tags=["User"])
 def get_booking_types():
     return supabase.table("booking_types") \
         .select(
-            "id, name, description, adult_price, child_price, total_capacity, features"
+            "id, name, description, adult_price, child_price, total_capacity, features, icon"
         ) \
         .eq("is_active", True) \
         .execute()
@@ -913,7 +909,31 @@ class TimeSlotRequest(BaseModel):
     end_time: str
     capacity: int
 
+# -------------------------
+# Icons API
+# -------------------------
+class BookingIconRequest(BaseModel):
+    name: str
+    icon: str
 
+@app.post("/admin/booking-icon", tags=["Admin"])
+def create_booking_icon(data: BookingIconRequest):
+    return supabase_admin.table("booking_icons").insert({
+        "name": data.name,
+        "icon": data.icon
+    }).execute()
+
+
+@app.get("/booking-icons", tags=["User"])
+def get_booking_icons():
+    return supabase.table("booking_icons") \
+        .select("id, name, icon") \
+        .eq("is_active", True) \
+        .execute()
+
+# -------------------------
+# Time-slots API
+# -------------------------
 @app.get("/time-slots/{booking_type_id}", tags=["User"])
 def get_time_slots(booking_type_id: str):
     return supabase.table("time_slots") \
@@ -1016,11 +1036,11 @@ class PriceRequest(BaseModel):
 
 
 class UpdateAddonRequest(BaseModel):
-    price: Optional[float] = Field(None, gt=0)
     name: Optional[str] = None
     description: Optional[str] = None
-    price: Optional[float] = None
-    is_active: Optional[bool] = None 
+    price: Optional[float] = Field(None, gt=0)
+    is_active: Optional[bool] = None
+
 
 
 @app.post("/admin/addon", tags=["Admin"])
@@ -1425,9 +1445,11 @@ def create_booking(data: BookingRequest):
 # Cash-received Bookings API
 # -------------------------
 @app.post("/admin/booking/{booking_id}/cash-received", tags=["Admin"])
-def mark_cash_received(booking_id: str):
+def mark_cash_received(
+    booking_id: str,
+    background_tasks: BackgroundTasks
+):
 
-    # 1️⃣ Get booking details
     booking_res = supabase_admin.table("bookings") \
         .select("id, contact_name, contact_email, visit_date, total_amount, payment_received") \
         .eq("id", booking_id) \
@@ -1444,20 +1466,25 @@ def mark_cash_received(booking_id: str):
             "message": "Payment already marked as received"
         }
 
-    # 2️⃣ Mark payment as received
     supabase_admin.table("bookings") \
         .update({"payment_received": True}) \
         .eq("id", booking_id) \
         .execute()
 
-    # 3️⃣ Send payment received email
     email_body = payment_received_email_template(booking)
-    send_email(booking["contact_email"], "Payment Received - Animal Farm", email_body)
+
+    background_tasks.add_task(
+        send_email,
+        booking["contact_email"],
+        "Payment Received - Animal Farm",
+        email_body
+    )
 
     return {
         "status": "success",
-        "message": "Cash marked as received and email sent"
+        "message": "Cash marked as received and email Send"
     }
+
 
 
 # -------------------------
@@ -1468,7 +1495,7 @@ def get_user_bookings(user_id: str):
 
     return supabase.table("bookings") \
         .select(
-            "id, visit_date, status, adults, children, booking_types(name), time_slots(slot_name,start_time,end_time), booking_addons(addons(name,price))"
+            "id, visit_date, status, adults, children, booking_types(name, booking_icons(icon)), time_slots(slot_name,start_time,end_time), booking_addons(addons(name,price))"
         ) \
         .eq("user_id", user_id) \
         .execute()
@@ -1521,7 +1548,7 @@ def admin_booking_details(booking_id: str):
             notes,
             booking_types(name),
             time_slots(slot_name,start_time,end_time)
-        """) \
+""") \
         .eq("id", booking_id) \
         .single() \
         .execute()
@@ -1551,19 +1578,45 @@ def admin_stats():
         "this_year": year
     }
 
+
+# -------------------------
+# Auth dependency
+# -------------------------
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization:
+        raise HTTPException(401, "Authorization header missing")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Invalid auth format")
+
+    token = authorization.replace("Bearer ", "")
+    res = supabase.auth.get_user(token)
+
+    if not res or not res.user:
+        raise HTTPException(401, "Invalid or expired token")
+
+    return res.user.id
+
 # -------------------------
 # User Show My Bookings API
 # -------------------------
 @app.get("/my-bookings/{user_id}", tags=["User"])
-def my_bookings(user_id: str):
+def my_bookings(
+    user_id: str,
+    current_user_id: str = Depends(get_current_user)
+):
+
+    if user_id != current_user_id:
+        raise HTTPException(403, "Not allowed")
 
     return supabase.table("bookings") \
         .select(
-            "id,  visit_date,status,adults, children, total_amount,  contact_email,  contact_phone,   booking_types(name), time_slots(slot_name,start_time,end_time), booking_addons(addons(name,price))"
+            "id, visit_date,status,adults, children, total_amount, contact_email, contact_phone, booking_types(name, icon), time_slots(slot_name,start_time,end_time), booking_addons(addons(name,price))"
         ) \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
         .execute()
+
 
 # -------------------------
 # Send Email Confirmation API
@@ -1652,22 +1705,6 @@ def cancel_booking(booking_id: str):
 # -------------------------
 # User Cancel Booking API
 # -------------------------
-def get_current_user(authorization: Optional[str] = Header(None)):
-    if not authorization:
-        raise HTTPException(401, "Authorization header missing")
-
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Invalid auth format")
-
-    token = authorization.replace("Bearer ", "")
-    res = supabase.auth.get_user(token)
-
-    if not res or not res.user:
-        raise HTTPException(401, "Invalid or expired token")
-
-    return res.user.id
-
-
 @app.post("/cancel-booking/{booking_id}", tags=["User"])
 def user_cancel_booking(
     booking_id: str,
@@ -1772,30 +1809,42 @@ def cash_revenue():
 # Download Receipt API
 # ------------------------- 
 @app.get("/booking/{booking_id}/receipt", tags=["User"])
-def download_receipt(booking_id: str):
+def download_receipt(
+    booking_id: str,
+    current_user_id: str = Depends(get_current_user)
+):
 
-    booking = supabase.table("bookings") \
-        .select(
-            """
-            id,
-            visit_date,
-            adults,
-            children,
-            total_amount,
-            payment_method,
-            payment_received,
-            contact_name,
-            booking_types(name),
-            time_slots(slot_name,start_time,end_time)
-            """
-        ) \
+    res = supabase.table("bookings") \
+        .select("""
+        id,
+        user_id,
+        visit_date,
+        adults,
+        children,
+        total_amount,
+        payment_method,
+        payment_received,
+        contact_name,
+        booking_types(name, icon),
+        time_slots(slot_name,start_time,end_time)
+        """) \
         .eq("id", booking_id) \
-        .execute().data[0]
+        .execute()
+
+    if not res.data:
+        raise HTTPException(404, "Booking not found")
+
+    booking = res.data[0]
+
+    # SECURITY CHECK
+    if booking["user_id"] != current_user_id:
+        raise HTTPException(403, "Not allowed to access this receipt")
 
     os.makedirs("receipts", exist_ok=True)
     filename = f"receipts/receipt_{booking_id}.pdf"
 
     c = canvas.Canvas(filename, pagesize=A4)
+
 
     # Header
     c.setFont("Helvetica-Bold", 16)
@@ -1811,32 +1860,41 @@ def download_receipt(booking_id: str):
     c.drawString(50, y, f"Name: {booking['contact_name']}")
     y -= 20
     c.drawString(50, y, f"Visit Date: {booking['visit_date']}")
+
     y -= 20
-    c.drawString(50, y, f"Booking Type: {booking['booking_types']['name']}")
+
+    # ICON SAFE FETCH
+    icon = ""
+    if booking.get("booking_types"):
+        icon = booking["booking_types"].get("icon") or ""
+
+    c.drawString(50, y, f"Booking Type: {icon} {booking['booking_types']['name']}")
+
     y -= 20
-    # c.drawString(50, y, f"Time Slot: {booking['time_slots']['start_time']} - {booking['time_slots']['end_time']}")
-    c.drawString( 50, y, f"Time Slot: {booking['time_slots']['slot_name']} "f"({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})")
+    c.drawString(
+        50,
+        y,
+        f"Time Slot: {booking['time_slots']['slot_name']} "
+        f"({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})"
+    )
+
     y -= 20
     c.drawString(50, y, f"Adults: {booking['adults']}")
+
     y -= 20
     c.drawString(50, y, f"Children: {booking['children']}")
 
     # Divider
     y -= 30
     c.line(50, y, 550, y)
-    y -= 30
 
-    # Amount Section
+    y -= 30
     c.setFont("Helvetica-Bold", 12)
     c.drawString(50, y, f"Total Amount: ₹{booking['total_amount']}")
 
     y -= 25
     c.setFont("Helvetica", 11)
-    c.drawString(
-        50,
-        y,
-        f"Payment Method: Cash"
-    )
+    c.drawString(50, y, "Payment Method: Cash")
 
     y -= 20
     payment_status = "PAID" if booking["payment_received"] else "PAY AT COUNTER"
@@ -1852,6 +1910,8 @@ def download_receipt(booking_id: str):
     c.save()
 
     return FileResponse(filename, filename=f"receipt_{booking_id}.pdf")
+
+
 
 # -------------------------
 # Payment Received email Receipt API
@@ -1872,3 +1932,190 @@ def payment_received_email_template(booking):
     <p>We look forward to welcoming you!</p>
     """
 
+# -------------------------
+# Confirm Booking Email API
+# -------------------------
+@app.post("/booking/confirm", tags=["User"])
+def confirm_booking(
+    data: BookingRequest,
+    background_tasks: BackgroundTasks,
+    current_user_id: str = Depends(get_current_user)
+):
+    try:
+        # 1️⃣ Calculate price
+        price = calculate_price_internal(
+            data.booking_type_id,
+            data.adults,
+            data.children,
+            data.addons
+        )
+        total_amount = price["total"]
+
+        # 2️⃣ Create booking using RPC
+        res = supabase_admin.rpc(
+            "create_booking_safe",
+            {
+                "p_user_id": current_user_id,
+                "p_booking_type_id": data.booking_type_id,
+                "p_time_slot_id": data.time_slot_id,
+                "p_visit_date": data.visit_date.isoformat(),
+                "p_adults": data.adults,
+                "p_children": data.children,
+                "p_total_amount": total_amount,
+                "p_contact_name": data.contact_name,
+                "p_contact_email": data.contact_email,
+                "p_contact_phone": data.contact_phone,
+                "p_preferred_contact": data.preferred_contact,
+                "p_notes": data.notes
+            }
+        ).execute()
+
+        if not res.data:
+            raise HTTPException(500, "Booking creation failed")
+
+        booking_id = res.data
+
+        # 3️⃣ Fetch booking details for email + PDF
+        booking_res = supabase.table("bookings") \
+            .select("""
+                id, 
+                visit_date, 
+                adults, 
+                children, 
+                total_amount, 
+                contact_name,"
+                "booking_types(name, icon), time_slots(slot_name,start_time,end_time)
+                """) \
+            .eq("id", booking_id) \
+            .execute()
+
+        if not booking_res.data:
+            raise HTTPException(404, "Booking not found")
+
+        booking = booking_res.data[0]
+
+        # 4️⃣ Email body
+        email_body = f"""
+        <h2>Booking Confirmed 🎉</h2>
+
+        <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
+        <p><b>Name:</b> {booking['contact_name']}</p>
+        <p><b>Visit Date:</b> {booking['visit_date']}</p>
+        <p><b>Time Slot:</b> {booking['time_slots']['slot_name']} ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
+        <p><b>Adults:</b> {booking['adults']}</p>
+        <p><b>Children:</b> {booking['children']}</p>
+
+        <hr/>
+        <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
+        <p><b>Payment:</b> Pay at counter</p>
+
+        <br/>
+        <p>Thank you for booking with <b>Animal Farm</b> 🐄🌿</p>
+        """
+
+        # 5️⃣ Generate PDF receipt
+        pdf_path = generate_booking_receipt(booking)
+
+        # 6️⃣ Send email with PDF attachment (background)
+        try:
+            background_tasks.add_task(
+                send_email_with_attachment,
+                data.contact_email,
+                "Booking Confirmed - Animal Farm 🐄🌿",
+                email_body,
+                pdf_path
+            )
+            print("Booking email queued for:", data.contact_email)
+        except Exception as e:
+            print("Email scheduling failed:", e)
+
+        return {
+            "status": "success",
+            "message": "Booking confirmed",
+            "booking_name": booking["booking_types"]["name"],
+            "total_amount": total_amount
+        }
+
+    except Exception as e:
+        print("BOOKING CONFIRM ERROR 👉", e)
+
+    if "Slot full" in str(e):
+        raise HTTPException(400, "Selected slot is full")
+
+    raise HTTPException(500, "Booking confirm failed")
+
+
+
+# -------------------------
+# Generate PDF Booking Receipt API
+# ------------------------- 
+def generate_booking_receipt(booking):
+    os.makedirs("receipts", exist_ok=True)
+    filename = f"receipts/receipt_{booking['id']}.pdf"
+
+    c = canvas.Canvas(filename, pagesize=A4)
+
+    # Header
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, 800, "Animal Farm - Booking Receipt")
+
+    # Safe icon fetch
+    icon = ""
+    if booking.get("booking_types"):
+        icon = booking["booking_types"].get("icon") or ""
+
+    # Body
+    c.setFont("Helvetica", 11)
+
+    c.drawString(50, 760, f"Booking: {icon} {booking['booking_types']['name']}")
+    c.drawString(50, 735, f"Name: {booking['contact_name']}")
+    c.drawString(50, 710, f"Visit Date: {booking['visit_date']}")
+
+    c.drawString(
+        50,
+        685,
+        f"Time Slot: {booking['time_slots']['slot_name']} "
+        f"({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})"
+    )
+
+    c.drawString(50, 650, f"Adults: {booking['adults']}")
+    c.drawString(50, 625, f"Children: {booking['children']}")
+
+    # Amount Section
+    c.drawString(50, 580, f"Total Amount: ₹{booking['total_amount']}")
+    c.drawString(50, 555, "Payment: Pay at counter")
+
+    # Footer (IMPORTANT: save आधी लिहायचं)
+    c.setFont("Helvetica-Oblique", 10)
+    c.drawString(50, 500, "Thank you for booking with Animal Farm")
+
+    # Single save only
+    c.save()
+
+    return filename
+
+
+# -------------------------
+# Send Email with PDF Attachment API
+# ------------------------- 
+def send_email_with_attachment(to_email, subject, body, pdf_path):
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subject
+
+        msg.attach(MIMEText(body, "html"))
+
+        with open(pdf_path, "rb") as f:
+            part = MIMEApplication(f.read(), _subtype="pdf")
+            part.add_header("Content-Disposition","attachment", filename=os.path.basename(pdf_path))
+            msg.attach(part)
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+
+    except Exception as e:
+        print("EMAIL FAILED:", e)
