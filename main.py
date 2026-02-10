@@ -965,7 +965,7 @@ def update_booking_type(booking_type_id: str, data: UpdateBookingTypeRequest):
 def get_admin_booking_types():
     return supabase_admin.table("booking_types") \
         .select(
-            "id, name, description, adult_price, child_price, total_capacity, is_active"
+            "id, name, description, adult_price, child_price, total_capacity, is_active , features"
         ) \
         .execute()
 
