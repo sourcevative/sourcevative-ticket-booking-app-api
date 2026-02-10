@@ -18,10 +18,11 @@ from datetime import datetime, timedelta, date, timezone
 from fastapi.responses import FileResponse
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from fastapi import Header
 from typing import Optional
 from fastapi import Depends, Header
-from fastapi import BackgroundTasks
+from fastapi import Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 
 load_dotenv()
 
@@ -50,6 +51,9 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Admin client with service role key (bypasses RLS)
 supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# HTTP Bearer auth scheme for protected routes
+security = HTTPBearer(auto_error=True)
 
 app = FastAPI(
     title="Animal Farm API",
@@ -1003,12 +1007,56 @@ def toggle_booking_type(booking_type_id: str, is_active: bool):
         .eq("id", booking_type_id) \
         .execute()
 
+# -------------------------
+# Auth dependency
+# -------------------------
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> str:
+
+    token = credentials.credentials
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    try:
+        user_res = supabase.auth.get_user(token)
+
+        user = getattr(user_res, "user", None) or (user_res.get("user") if isinstance(user_res, dict) else None)
+
+        if not user or not getattr(user, "id", None):
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        return user.id
+
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def get_current_admin(current_user_id: str = Depends(get_current_user)):
+    """
+    Ensure the current user is an admin (role == 1) and return their user_id.
+    """
+    res = supabase.table("profiles") \
+        .select("role") \
+        .eq("id", current_user_id) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    role = res.data[0]["role"]
+
+    if role != 1:
+        raise HTTPException(status_code=403, detail="Only admin allowed")
+
+    return current_user_id
+
 
 # -------------------------
 # User Book Ticket API
 # -------------------------
 class BookingRequest(BaseModel):
-    user_id: str
     booking_type_id: str
     time_slot_id: str
     visit_date: date
@@ -1148,8 +1196,10 @@ def update_addon(addon_id: str, data: UpdateAddonRequest):
 # Counter Booking API
 # ------------------------- 
 @app.post("/admin/book-walkin", tags=["Admin"])
-def admin_book_walkin(data: BookingRequest):
-
+def admin_book_walkin(
+    data: BookingRequest,
+    current_user_id: str = Depends(get_current_admin)
+):
     price = calculate_price_internal(
         data.booking_type_id,
         data.adults,
@@ -1158,18 +1208,22 @@ def admin_book_walkin(data: BookingRequest):
     )
 
     res = supabase_admin.rpc("create_walkin_booking", {
-        "p_name": data.contact_name,
-        "p_phone": data.contact_phone,
-        "p_email": data.contact_email,
-        "p_booking_type_id": data.booking_type_id,
-        "p_time_slot_id": data.time_slot_id,
-        "p_visit_date": data.visit_date.isoformat(),
-        "p_adults": data.adults,
-        "p_children": data.children,
-        "p_total_amount": price["total"],
-        "p_preferred_contact": data.preferred_contact,
-        "p_notes": data.notes
-    }).execute()
+    "p_name": data.contact_name,
+    "p_phone": data.contact_phone,
+    "p_email": data.contact_email,
+    "p_booking_type_id": data.booking_type_id,
+    "p_time_slot_id": data.time_slot_id,
+    "p_visit_date": data.visit_date.isoformat(),
+    "p_adults": data.adults,
+    "p_children": data.children,
+    "p_total_amount": price["total"],
+    "p_preferred_contact": data.preferred_contact,
+    "p_notes": data.notes,
+    "p_created_by": current_user_id,
+    "p_booking_source": "walkin"
+
+}).execute()
+
 
     return {
         "status": "success",
@@ -1178,6 +1232,26 @@ def admin_book_walkin(data: BookingRequest):
         "message": "Walk-in booking confirmed"
     }
 
+# -------------------------
+# Check Booking mode API
+# -------------------------
+@app.get("/admin/booking-source-stats", tags=["Admin"])
+def booking_source_stats():
+
+    online = supabase_admin.table("bookings") \
+        .select("id") \
+        .eq("booking_source", "online") \
+        .execute().data
+
+    walkin = supabase_admin.table("bookings") \
+        .select("id") \
+        .eq("booking_source", "walkin") \
+        .execute().data
+
+    return {
+        "online_bookings": len(online),
+        "walkin_bookings": len(walkin)
+    }
 
 # -------------------------
 # User Add Addons to Booking API
@@ -1279,48 +1353,6 @@ def calculate_price(data: PriceRequest):
         data.addons
     )
     
-    # Validate that booking type exists
-    if not booking_type_result.data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Booking type with ID {data.booking_type_id} not found. Please verify the booking type ID is correct."
-        )
-    
-    bt = booking_type_result.data[0]
-    
-    # Warn if booking type is inactive (but still allow price calculation)
-    if not bt.get("is_active", True):
-        pass
-
-    base = (data.adults * bt["adult_price"]) + (data.children * bt["child_price"])
-
-    addon_total = 0
-    if data.addons:
-        addons_result = supabase.table("addons") \
-            .select("id, price") \
-            .in_("id", data.addons) \
-            .execute()
-        
-        addons = addons_result.data
-        
-        # Validate that all addons exist
-        existing_addon_ids = {addon["id"] for addon in addons} if addons else set()
-        missing_addon_ids = set(data.addons) - existing_addon_ids
-        
-        if missing_addon_ids:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Addons not found: {', '.join(missing_addon_ids)}"
-            )
-
-        for a in addons:
-            addon_total += a["price"]
-
-    return {
-        "base_price": base,
-        "addon_total": addon_total,
-        "total": base + addon_total
-    }
 
 # -------------------------
 # Admin Show All Bookings API
@@ -1373,72 +1405,79 @@ def calculate_price(data: PriceRequest):
 #             raise HTTPException(status_code=400, detail=error_msg)
 
 #         raise HTTPException(status_code=500, detail="Unable to create booking")
+# -------------------------
+# Admin Show All Bookings API
+# -------------------------
+# @app.post("/book", tags=["User"])
+# def create_booking(
+#     data: BookingRequest,
+#     background_tasks: BackgroundTasks,
+#     current_user_id: str = Depends(get_current_user)
+# ):
 
-@app.post("/book", tags=["User"])
-def create_booking(data: BookingRequest):
+#     #1. USER VALIDATION
+#     user_res = supabase.table("profiles") \
+#         .select("id") \
+#         .eq("id", current_user_id) \
+#         .execute()
 
-    # 🔒 1. USER VALIDATION
-    user_res = supabase.table("profiles") \
-        .select("id") \
-        .eq("id", data.user_id) \
-        .execute()
+#     if not user_res.data:
+#         raise HTTPException(status_code=400, detail="Invalid user")
 
-    if not user_res.data:
-        raise HTTPException(status_code=400, detail="Invalid user")
+#     #2. SAFE ADDONS
+#     addons = data.addons or []
 
-    # 🧹 2. SAFE ADDONS
-    addons = data.addons or []
+#     #3. PRICE CALCULATION (SAFE)
+#     try:
+#         price = calculate_price_internal(
+#             data.booking_type_id,
+#             data.adults,
+#             data.children,
+#             addons
+#         )
+#     except Exception as e:
+#         print("PRICE ERROR 👉", e)
+#         raise HTTPException(status_code=400, detail="Invalid price data")
 
-    # 💰 3. PRICE CALCULATION (SAFE)
-    try:
-        price = calculate_price_internal(
-            data.booking_type_id,
-            data.adults,
-            data.children,
-            addons
-        )
-    except Exception as e:
-        print("PRICE ERROR 👉", e)
-        raise HTTPException(status_code=400, detail="Invalid price data")
+#     #4. DATE SAFETY
+#     try:
+#         visit_date = data.visit_date.isoformat()
+#     except Exception:
+#         raise HTTPException(status_code=400, detail="Invalid visit date")
 
-    # 📅 4. DATE SAFETY
-    try:
-        visit_date = data.visit_date.isoformat()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid visit date")
+#     #5. BOOKING RPC
+#     try:
+#         res = supabase_admin.rpc(
+#             "create_booking_safe",
+#             {
+#                 "p_user_id": current_user_id,
+#                 "p_booking_type_id": data.booking_type_id,
+#                 "p_time_slot_id": data.time_slot_id,
+#                 "p_visit_date": visit_date,
+#                 "p_adults": data.adults,
+#                 "p_children": data.children,
+#                 "p_total_amount": price["total"],
+#                 "p_contact_name": data.contact_name,
+#                 "p_contact_email": data.contact_email,
+#                 "p_contact_phone": data.contact_phone,
+#                 "p_preferred_contact": data.preferred_contact,
+#                 "p_notes": data.notes
+#             }
+#         ).execute()
 
-    # 🚀 5. BOOKING RPC
-    try:
-        res = supabase_admin.rpc(
-            "create_booking_safe",
-            {
-                "p_user_id": data.user_id,
-                "p_booking_type_id": data.booking_type_id,
-                "p_time_slot_id": data.time_slot_id,
-                "p_visit_date": visit_date,
-                "p_adults": data.adults,
-                "p_children": data.children,
-                "p_total_amount": price["total"],
-                "p_contact_name": data.contact_name,
-                "p_contact_email": data.contact_email,
-                "p_contact_phone": data.contact_phone,
-                "p_preferred_contact": data.preferred_contact,
-                "p_notes": data.notes
-            }
-        ).execute()
+#         if not res.data:
+#             raise Exception("RPC failed")
 
-        if not res.data:
-            raise Exception("RPC failed")
+#         return {
+#             "status": "success",
+#             "booking_id": res.data,
+#             "total_amount": price["total"]
+#         }
 
-        return {
-            "status": "success",
-            "booking_id": res.data,
-            "total_amount": price["total"]
-        }
+#     except Exception as e:
+#         print("BOOKING ERROR 👉", e)
+#         raise HTTPException(status_code=500, detail=str(e))
 
-    except Exception as e:
-        print("BOOKING ERROR 👉", e)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # -------------------------
@@ -1578,24 +1617,6 @@ def admin_stats():
         "this_year": year
     }
 
-
-# -------------------------
-# Auth dependency
-# -------------------------
-def get_current_user(authorization: Optional[str] = Header(None)):
-    if not authorization:
-        raise HTTPException(401, "Authorization header missing")
-
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Invalid auth format")
-
-    token = authorization.replace("Bearer ", "")
-    res = supabase.auth.get_user(token)
-
-    if not res or not res.user:
-        raise HTTPException(401, "Invalid or expired token")
-
-    return res.user.id
 
 # -------------------------
 # User Show My Bookings API
@@ -1942,7 +1963,7 @@ def confirm_booking(
     current_user_id: str = Depends(get_current_user)
 ):
     try:
-        # 1️⃣ Calculate price
+        # 1. Calculate price
         price = calculate_price_internal(
             data.booking_type_id,
             data.adults,
@@ -1951,7 +1972,7 @@ def confirm_booking(
         )
         total_amount = price["total"]
 
-        # 2️⃣ Create booking using RPC
+        # 2️. Create booking using RPC
         res = supabase_admin.rpc(
             "create_booking_safe",
             {
@@ -1966,7 +1987,9 @@ def confirm_booking(
                 "p_contact_email": data.contact_email,
                 "p_contact_phone": data.contact_phone,
                 "p_preferred_contact": data.preferred_contact,
-                "p_notes": data.notes
+                "p_notes": data.notes,
+                "p_booking_source": "online"
+
             }
         ).execute()
 
@@ -1975,17 +1998,18 @@ def confirm_booking(
 
         booking_id = res.data
 
-        # 3️⃣ Fetch booking details for email + PDF
+        # 3️. Fetch booking details for email + PDF
         booking_res = supabase.table("bookings") \
-            .select("""
-                id, 
-                visit_date, 
-                adults, 
-                children, 
-                total_amount, 
-                contact_name,"
-                "booking_types(name, icon), time_slots(slot_name,start_time,end_time)
-                """) \
+        .select("""
+        id,
+        visit_date,
+        adults,
+        children,
+        total_amount,
+        contact_name,
+        booking_types(name, icon),
+        time_slots(slot_name,start_time,end_time)
+    """) \
             .eq("id", booking_id) \
             .execute()
 
@@ -1994,7 +2018,7 @@ def confirm_booking(
 
         booking = booking_res.data[0]
 
-        # 4️⃣ Email body
+        # 4. Email body
         email_body = f"""
         <h2>Booking Confirmed 🎉</h2>
 
@@ -2013,10 +2037,10 @@ def confirm_booking(
         <p>Thank you for booking with <b>Animal Farm</b> 🐄🌿</p>
         """
 
-        # 5️⃣ Generate PDF receipt
+        # 5. Generate PDF receipt
         pdf_path = generate_booking_receipt(booking)
 
-        # 6️⃣ Send email with PDF attachment (background)
+        # 6. Send email with PDF attachment (background)
         try:
             background_tasks.add_task(
                 send_email_with_attachment,
@@ -2039,10 +2063,11 @@ def confirm_booking(
     except Exception as e:
         print("BOOKING CONFIRM ERROR 👉", e)
 
-    if "Slot full" in str(e):
-        raise HTTPException(400, "Selected slot is full")
+        if "Slot full" in str(e):
+            raise HTTPException(400, "Selected slot is full")
 
-    raise HTTPException(500, "Booking confirm failed")
+        raise HTTPException(500, "Booking confirm failed")
+
 
 
 
@@ -2119,3 +2144,83 @@ def send_email_with_attachment(to_email, subject, body, pdf_path):
 
     except Exception as e:
         print("EMAIL FAILED:", e)
+
+
+# -------------------------
+# Admin Dashboard API
+# ------------------------- 
+@app.get("/admin/dashboard", tags=["Admin"])
+def admin_dashboard():
+
+    now = datetime.utcnow()
+
+    start_current_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_month = (start_current_month - timedelta(days=1)).replace(day=1)
+
+    # ALL BOOKINGS (booking_source include karaycha)
+    current_month_bookings = supabase_admin.table("bookings") \
+        .select("id, adults, children, status, total_amount, payment_received, booking_source") \
+        .gte("created_at", start_current_month.isoformat()) \
+        .execute().data
+
+    last_month_bookings = supabase_admin.table("bookings") \
+        .select("id") \
+        .gte("created_at", last_month.isoformat()) \
+        .lt("created_at", start_current_month.isoformat()) \
+        .execute().data
+
+    total_bookings = supabase_admin.table("bookings") \
+        .select("id, adults, children, status, total_amount, payment_received, booking_source") \
+        .execute().data
+
+    # 1 Total bookings
+    total_booking_count = len(total_bookings)
+
+    # Growth %
+    current_count = len(current_month_bookings)
+    last_count = len(last_month_bookings)
+
+    booking_growth = ((current_count - last_count) / last_count * 100) if last_count else 0
+
+    # 2 Revenue
+    total_revenue = sum(b["total_amount"] or 0 for b in total_bookings if b["payment_received"])
+
+    current_revenue = sum(b["total_amount"] or 0 for b in current_month_bookings if b["payment_received"])
+
+    last_month_rows = supabase_admin.table("bookings") \
+        .select("total_amount, payment_received") \
+        .gte("created_at", last_month.isoformat()) \
+        .lt("created_at", start_current_month.isoformat()) \
+        .execute().data
+
+    last_revenue = sum(b["total_amount"] or 0 for b in last_month_rows if b["payment_received"])
+
+    revenue_growth = ((current_revenue - last_revenue) / last_revenue * 100) if last_revenue else 0
+
+    # 3 Avg group size
+    total_people = sum((b["adults"] + b["children"]) for b in total_bookings)
+    avg_group_size = (total_people / total_booking_count) if total_booking_count else 0
+
+    # 4 Cancellation rate
+    cancelled = len([b for b in total_bookings if b["status"] == "cancelled"])
+    cancellation_rate = (cancelled / total_booking_count * 100) if total_booking_count else 0
+
+    # 5 Online vs Walk-in (NEW)
+    online_count = len([b for b in total_bookings if b.get("booking_source") == "online"])
+    walkin_count = len([b for b in total_bookings if b.get("booking_source") == "walkin"])
+
+    return {
+        "total_bookings": total_booking_count,
+        "booking_growth_percent": round(booking_growth, 1),
+
+        "total_revenue": total_revenue,
+        "revenue_growth_percent": round(revenue_growth, 1),
+
+        "avg_group_size": round(avg_group_size, 1),
+
+        "cancellation_rate": round(cancellation_rate, 1),
+
+        # NEW DATA
+        "online_bookings": online_count,
+        "walkin_bookings": walkin_count
+    }
