@@ -72,7 +72,7 @@ def ensure_tables():
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Frontend URL
+    allow_origins=["http://localhost:3000",],  # Frontend URL
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
@@ -1057,6 +1057,7 @@ def get_current_admin(current_user_id: str = Depends(get_current_user)):
 # User Book Ticket API
 # -------------------------
 class BookingRequest(BaseModel):
+    # user_id: str
     booking_type_id: str
     time_slot_id: str
     visit_date: date
@@ -1970,7 +1971,8 @@ def confirm_booking(
             data.children,
             data.addons
         )
-        total_amount = price["total"]
+        # total_amount = price["total"]
+        total_amount = round(price["total"], 2)
 
         # 2️. Create booking using RPC
         res = supabase_admin.rpc(
@@ -1992,6 +1994,7 @@ def confirm_booking(
 
             }
         ).execute()
+        print("RPC RESPONSE 👉", res)
 
         if not res.data:
             raise HTTPException(500, "Booking creation failed")
