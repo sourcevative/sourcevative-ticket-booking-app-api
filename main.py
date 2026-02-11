@@ -68,7 +68,7 @@ def ensure_tables():
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Frontend URL
+    allow_origins=["http://localhost:3000",],  # Frontend URL
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
@@ -1008,7 +1008,7 @@ def toggle_booking_type(booking_type_id: str, is_active: bool):
 # User Book Ticket API
 # -------------------------
 class BookingRequest(BaseModel):
-    user_id: str
+    # user_id: str
     booking_type_id: str
     time_slot_id: str
     visit_date: date
@@ -1949,7 +1949,8 @@ def confirm_booking(
             data.children,
             data.addons
         )
-        total_amount = price["total"]
+        # total_amount = price["total"]
+        total_amount = round(price["total"], 2)
 
         # 2️⃣ Create booking using RPC
         res = supabase_admin.rpc(
@@ -1969,6 +1970,7 @@ def confirm_booking(
                 "p_notes": data.notes
             }
         ).execute()
+        print("RPC RESPONSE 👉", res)
 
         if not res.data:
             raise HTTPException(500, "Booking creation failed")
@@ -1978,16 +1980,17 @@ def confirm_booking(
         # 3️⃣ Fetch booking details for email + PDF
         booking_res = supabase.table("bookings") \
             .select("""
-                id, 
-                visit_date, 
-                adults, 
-                children, 
-                total_amount, 
-                contact_name,"
-                "booking_types(name, icon), time_slots(slot_name,start_time,end_time)
-                """) \
-            .eq("id", booking_id) \
-            .execute()
+                id,
+                visit_date,
+                adults,
+                children,
+                total_amount,
+                contact_name,
+                booking_types(name, icon),
+                time_slots(slot_name,start_time,end_time)
+            """) \
+    .eq("id", booking_id) \
+    .execute()
 
         if not booking_res.data:
             raise HTTPException(404, "Booking not found")
@@ -2039,10 +2042,10 @@ def confirm_booking(
     except Exception as e:
         print("BOOKING CONFIRM ERROR 👉", e)
 
-    if "Slot full" in str(e):
-        raise HTTPException(400, "Selected slot is full")
+        if "Slot full" in str(e):
+            raise HTTPException(400, "Selected slot is full")
 
-    raise HTTPException(500, "Booking confirm failed")
+        raise HTTPException(500, "Booking confirm failed")
 
 
 
