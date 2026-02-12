@@ -618,7 +618,7 @@ def login_email_or_Phone_no(data: LoginRequest):
         if len(profile.data) == 0:
             raise HTTPException(status_code=404, detail="User profile not found")
 
-        # ✅ RETURN MUST BE INSIDE TRY
+        # RETURN MUST BE INSIDE TRY
         return {
             "status": "success",
             "access_token": session.access_token,
@@ -673,7 +673,7 @@ def logout(data: LogoutRequest):
 @app.post("/forgot-password", tags=["Authentication"])
 def forgot_password(data: ForgotPasswordRequest):
 
-    # 1. Find user
+    #  Find user
     if "@" in data.login:
         res = supabase_admin.table("profiles").select("id, email").eq("email", data.login).execute()
     else:
@@ -685,19 +685,19 @@ def forgot_password(data: ForgotPasswordRequest):
 
     user = res.data[0]
 
-    # 2. Generate secure token
+    #  Generate secure token
     token = secrets.token_urlsafe(32)
 
     expires_at = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
 
-    # 3. Store token
+    #  Store token
     supabase_admin.table("password_reset_tokens").insert({
         "user_id": user["id"],
         "token": token,
         "expires_at": expires_at
     }).execute()
 
-    # 4. Send email
+    #  Send email
     reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
 
     send_email(
@@ -735,7 +735,7 @@ def reset_password(data: ResetPasswordRequest):
                 detail="Password must be at least 6 characters long"
             )
 
-        # 🔍 Find valid token
+        #  Find valid token
         token_res = (
             supabase
             .table("password_reset_tokens")
@@ -768,13 +768,13 @@ def reset_password(data: ResetPasswordRequest):
 
         user_id = token_row["user_id"]
 
-        # 🔐 Update password (ADMIN API → service role key REQUIRED)
+        #  Update password (ADMIN API → service role key REQUIRED)
         supabase.auth.admin.update_user_by_id(
             user_id,
             {"password": data.new_password}
         )
 
-        # ✅ Mark token as used
+        #  Mark token as used
         supabase.table("password_reset_tokens").update(
             {"used": True}
         ).eq("id", token_row["id"]).execute()
@@ -839,7 +839,7 @@ def partial_update_booking_type(
     booking_type_id: str,
     data: PartialUpdateBookingTypeRequest
 ):
-    # 1️⃣ Existing booking type fetch करा
+    # Existing booking type fetch करा
     existing_res = (
         supabase_admin
         .table("booking_types")
@@ -853,12 +853,12 @@ def partial_update_booking_type(
 
     existing = existing_res.data[0]
 
-    # 2️⃣ Incoming data
+    #  Incoming data
     incoming = data.dict(exclude_unset=True)
 
     update_data = {}
 
-    # 3️⃣ Compare each field
+    # Compare each field
     for field, new_value in incoming.items():
 
         # empty string ignore
@@ -871,7 +871,7 @@ def partial_update_booking_type(
 
         old_value = existing.get(field)
 
-        # 4️⃣ Only update if value is actually changed
+        # Only update if value is actually changed
         if new_value != old_value:
             update_data[field] = new_value
 
@@ -881,7 +881,7 @@ def partial_update_booking_type(
             "message": "No changes detected"
         }
 
-    # 5️⃣ Update only changed fields
+    # Update only changed fields
     supabase_admin.table("booking_types") \
         .update(update_data) \
         .eq("id", booking_type_id) \
@@ -1020,7 +1020,8 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Missing token")
 
     try:
-        user_res = supabase.auth.get_user(token)
+        # user_res = supabase.auth.get_user(token) 
+        user_res = supabase_admin.auth.get_user(token) 
 
         user = getattr(user_res, "user", None) or (user_res.get("user") if isinstance(user_res, dict) else None)
 
@@ -1090,8 +1091,6 @@ class UpdateAddonRequest(BaseModel):
     price: Optional[float] = Field(None, gt=0)
     is_active: Optional[bool] = None
 
-
-
 @app.post("/admin/addon", tags=["Admin"])
 def create_addon(name: str, description: str, price: float):
     # Use admin client to bypass RLS policies
@@ -1102,7 +1101,9 @@ def create_addon(name: str, description: str, price: float):
         "is_active": True 
     }).execute()
 
-
+# -------------------------
+# Adons Show User API
+# ------------------------- 
 @app.get("/addons", tags=["User"])
 def get_addons():
     return supabase.table("addons") \
@@ -1110,7 +1111,9 @@ def get_addons():
         .eq("is_active", True) \
         .execute()
 
-
+# -------------------------
+# Adons Active Inactive API
+# ------------------------- 
 @app.patch("/admin/addon/{addon_id}/toggle", tags=["Admin"])
 def toggle_addon(addon_id: str, is_active: bool):
 
@@ -1138,7 +1141,7 @@ def toggle_addon(addon_id: str, is_active: bool):
 @app.patch("/admin/addon/{addon_id}", tags=["Admin"])
 def update_addon(addon_id: str, data: UpdateAddonRequest):
 
-    # 1️⃣ Existing addon fetch
+    #  Existing addon fetch
     existing_res = (
         supabase_admin
         .table("addons")
@@ -1152,12 +1155,12 @@ def update_addon(addon_id: str, data: UpdateAddonRequest):
 
     existing = existing_res.data[0]
 
-    # 2️⃣ Incoming data (only fields sent)
+    #  Incoming data (only fields sent)
     incoming = data.dict(exclude_unset=True)
 
     update_data = {}
 
-    # 3️⃣ Compare field by field
+    #  Compare field by field
     for field, new_value in incoming.items():
 
         # ignore None
@@ -1170,18 +1173,18 @@ def update_addon(addon_id: str, data: UpdateAddonRequest):
 
         old_value = existing.get(field)
 
-        # 4️⃣ Update only if value actually changed
+        #  Update only if value actually changed
         if new_value != old_value:
             update_data[field] = new_value
 
-    # 5️⃣ Nothing changed
+    #  Nothing changed
     if not update_data:
         return {
             "status": "success",
             "message": "No changes detected"
         }
 
-    # 6️⃣ Update only changed fields
+    #  Update only changed fields
     supabase_admin.table("addons") \
         .update(update_data) \
         .eq("id", addon_id) \
@@ -1194,44 +1197,114 @@ def update_addon(addon_id: str, data: UpdateAddonRequest):
     }
 
 # -------------------------
-# Counter Booking API
+# offline Booking API
 # ------------------------- 
 @app.post("/admin/book-walkin", tags=["Admin"])
 def admin_book_walkin(
     data: BookingRequest,
+    background_tasks: BackgroundTasks,
     current_user_id: str = Depends(get_current_admin)
 ):
-    price = calculate_price_internal(
-        data.booking_type_id,
-        data.adults,
-        data.children,
-        data.addons
-    )
 
-    res = supabase_admin.rpc("create_walkin_booking", {
-    "p_name": data.contact_name,
-    "p_phone": data.contact_phone,
-    "p_email": data.contact_email,
-    "p_booking_type_id": data.booking_type_id,
-    "p_time_slot_id": data.time_slot_id,
-    "p_visit_date": data.visit_date.isoformat(),
-    "p_adults": data.adults,
-    "p_children": data.children,
-    "p_total_amount": price["total"],
-    "p_preferred_contact": data.preferred_contact,
-    "p_notes": data.notes,
-    "p_created_by": current_user_id,
-    "p_booking_source": "walkin"
+    try:
+        print("🔥 WALKIN API HIT")
+        print("🔥 CURRENT ADMIN ID:", current_user_id)
 
-}).execute()
+        # Price calculation
+        price = calculate_price_internal(
+            data.booking_type_id,
+            data.adults,
+            data.children,
+            data.addons
+        )
 
+        total_amount = round(price["total"], 2)
 
-    return {
-        "status": "success",
-        "booking_id": res.data,
-        "total_amount": price["total"],
-        "message": "Walk-in booking confirmed"
-    }
+        #  Create walk-in booking via RPC
+        res = supabase_admin.rpc("create_walkin_booking", {
+            "p_name": data.contact_name,
+            "p_phone": data.contact_phone,
+            "p_email": data.contact_email,
+            "p_booking_type_id": data.booking_type_id,
+            "p_time_slot_id": data.time_slot_id,
+            "p_visit_date": data.visit_date.isoformat(),
+            "p_adults": data.adults,
+            "p_children": data.children,
+            "p_total_amount": total_amount,
+            "p_preferred_contact": data.preferred_contact,
+            "p_notes": data.notes,
+            "p_created_by": current_user_id,
+        }).execute()
+
+        if not res.data:
+            raise HTTPException(500, "Walk-in booking failed")
+
+        booking_id = res.data
+
+        #  Fetch booking details for email + PDF
+        booking_res = supabase.table("bookings") \
+            .select("""
+                id,
+                visit_date,
+                adults,
+                children,
+                total_amount,
+                contact_name,
+                contact_email,
+                booking_types(name, icon),
+                time_slots(slot_name,start_time,end_time)
+            """) \
+            .eq("id", booking_id) \
+            .execute()
+
+        if not booking_res.data:
+            raise HTTPException(404, "Booking not found")
+
+        booking = booking_res.data[0]
+
+        #  Email body
+        email_body = f"""
+        <h2>Booking Confirmed 🎉</h2>
+
+        <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
+        <p><b>Name:</b> {booking['contact_name']}</p>
+        <p><b>Visit Date:</b> {booking['visit_date']}</p>
+        <p><b>Time Slot:</b> {booking['time_slots']['slot_name']} 
+        ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
+        <p><b>Adults:</b> {booking['adults']}</p>
+        <p><b>Children:</b> {booking['children']}</p>
+
+        <hr/>
+        <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
+        <p><b>Payment:</b> Cash (Pay at counter)</p>
+
+        <br/>
+        <p>Thank you for booking with <b>Animal Farm</b> 🐄🌿</p>
+        """
+
+        #  Generate PDF receipt
+        pdf_path = generate_booking_receipt(booking)
+
+        #  Send email in background with attachment
+        background_tasks.add_task(
+            send_email_with_attachment,
+            booking["contact_email"],
+            "Walk-in Booking Confirmed - Animal Farm 🐄🌿",
+            email_body,
+            pdf_path
+        )
+
+        return {
+            "status": "success",
+            "booking_id": booking_id,
+            "total_amount": total_amount,
+            "message": "Walk-in booking confirmed & email sent"
+        }
+
+    except Exception as e:
+        print("WALKIN BOOKING ERROR 👉", e)
+        raise HTTPException(500, "Walk-in booking failed")
+
 
 # -------------------------
 # Check Booking mode API
@@ -1990,7 +2063,7 @@ def confirm_booking(
                 "p_contact_phone": data.contact_phone,
                 "p_preferred_contact": data.preferred_contact,
                 "p_notes": data.notes,
-                "p_booking_source": "online"
+                # "p_booking_source": "online"
 
             }
         ).execute()
