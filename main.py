@@ -992,7 +992,7 @@ def update_booking_type(booking_type_id: str, data: UpdateBookingTypeRequest):
 def get_admin_booking_types():
     return supabase_admin.table("booking_types") \
         .select(
-            "id, name, description, adult_price, child_price, total_capacity, is_active , features"
+            "id, name, description, adult_price, child_price, total_capacity, is_active , features, icon"
         ) \
         .execute()
 
@@ -1106,7 +1106,7 @@ def create_addon(name: str, description: str, price: float):
 # ------------------------- 
 @app.get("/addons", tags=["User"])
 def get_addons():
-    return supabase.table("addons") \
+    return supabase_admin.table("addons") \
         .select("*") \
         .eq("is_active", True) \
         .execute()
@@ -1775,27 +1775,96 @@ def cancel_email_template(booking, user):
 # Admin Cancel Booking API
 # -------------------------    
 
+# @app.post("/admin/cancel-booking/{booking_id}", tags=["Admin"])
+# def cancel_booking(booking_id: str):
+
+#     booking = supabase.table("bookings") \
+#         .select("*, profiles(email)") \
+#         .eq("id", booking_id) \
+#         .execute().data[0]
+
+#     supabase.table("bookings") \
+#         .update({"status": "cancelled"}) \
+#         .eq("id", booking_id) \
+#         .execute()
+
+#     email_body = cancel_email_template(booking, booking["profiles"])
+
+#     send_email(booking["contact_email"], "Booking Cancelled", email_body)
+
+#     if booking["profiles"]["email"] != booking["contact_email"]:
+#         send_email(booking["profiles"]["email"], "Booking Cancelled", email_body)
+
+#     return {"status": "cancelled"}
+
+# 
 @app.post("/admin/cancel-booking/{booking_id}", tags=["Admin"])
 def cancel_booking(booking_id: str):
 
-    booking = supabase.table("bookings") \
-        .select("*, profiles(email)") \
+    # Fetch booking with profile name + email
+    res = supabase.table("bookings") \
+        .select("*, profiles(email, name)") \
         .eq("id", booking_id) \
-        .execute().data[0]
+        .execute()
 
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking = res.data[0]
+
+    # Prevent double cancellation
+    if booking.get("status") == "cancelled":
+        raise HTTPException(status_code=400, detail="Booking already cancelled")
+
+    # Update booking status
     supabase.table("bookings") \
         .update({"status": "cancelled"}) \
         .eq("id", booking_id) \
         .execute()
 
-    email_body = cancel_email_template(booking, booking["profiles"])
+    profile = booking.get("profiles")
 
-    send_email(booking["contact_email"], "Booking Cancelled", email_body)
+    # Generate email body safely
+    user_name = None
+    if profile and profile.get("name"):
+        user_name = profile.get("name")
+    else:
+        user_name = booking.get("contact_name", "Customer")
 
-    if booking["profiles"]["email"] != booking["contact_email"]:
-        send_email(booking["profiles"]["email"], "Booking Cancelled", email_body)
+    email_body = f"""
+Hi {user_name},
+
+Your booking scheduled on {booking['visit_date']} has been cancelled successfully.
+
+If you have any questions, please contact our support team.
+
+Regards,
+Team
+"""
+
+    # Send to contact email (walk-in / primary email)
+    if booking.get("contact_email"):
+        send_email(
+            booking["contact_email"],
+            "Booking Cancelled",
+            email_body
+        )
+
+    # Send to registered profile email if different
+    if profile and profile.get("email"):
+        profile_email = profile.get("email")
+
+        if profile_email != booking.get("contact_email"):
+            send_email(
+                profile_email,
+                "Booking Cancelled",
+                email_body
+            )
 
     return {"status": "cancelled"}
+
+
+
 
 # -------------------------
 # User Cancel Booking API
