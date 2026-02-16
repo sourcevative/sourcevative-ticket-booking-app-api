@@ -1,4 +1,5 @@
 import os
+import csv
 import uuid
 import smtplib
 import secrets
@@ -22,6 +23,11 @@ from typing import Optional
 from fastapi import Depends, Header
 from fastapi import Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from openpyxl import Workbook
+from fastapi.responses import StreamingResponse
+from collections import Counter
+from collections import defaultdict
+
 
 
 load_dotenv()
@@ -985,6 +991,7 @@ def update_booking_type(booking_type_id: str, data: UpdateBookingTypeRequest):
         }) \
         .eq("id", booking_type_id) \
         .execute()
+
 # -------------------------
 # Create Time Slot API
 # -------------------------
@@ -992,7 +999,7 @@ def update_booking_type(booking_type_id: str, data: UpdateBookingTypeRequest):
 def get_admin_booking_types():
     return supabase_admin.table("booking_types") \
         .select(
-            "id, name, description, adult_price, child_price, total_capacity, is_active , features"
+            "id, name, description, adult_price, child_price, total_capacity, is_active , features, icon"
         ) \
         .execute()
 
@@ -2028,7 +2035,7 @@ def payment_received_email_template(booking):
     """
 
 # -------------------------
-# Confirm Booking Email API
+# booking by user Booking Email API
 # -------------------------
 @app.post("/booking/confirm", tags=["User"])
 def confirm_booking(
@@ -2044,10 +2051,9 @@ def confirm_booking(
             data.children,
             data.addons
         )
-        # total_amount = price["total"]
         total_amount = round(price["total"], 2)
 
-        # 2️. Create booking using RPC
+        # 2. Create booking using RPC (STATUS = PENDING inside RPC)
         res = supabase_admin.rpc(
             "create_booking_safe",
             {
@@ -2063,29 +2069,27 @@ def confirm_booking(
                 "p_contact_phone": data.contact_phone,
                 "p_preferred_contact": data.preferred_contact,
                 "p_notes": data.notes,
-                # "p_booking_source": "online"
-
+                "p_booking_source": "online"
             }
         ).execute()
-        print("RPC RESPONSE 👉", res)
 
         if not res.data:
             raise HTTPException(500, "Booking creation failed")
 
         booking_id = res.data
 
-        # 3️. Fetch booking details for email + PDF
+        # 3. Fetch booking details for email + PDF
         booking_res = supabase.table("bookings") \
-        .select("""
-        id,
-        visit_date,
-        adults,
-        children,
-        total_amount,
-        contact_name,
-        booking_types(name, icon),
-        time_slots(slot_name,start_time,end_time)
-    """) \
+            .select("""
+                id,
+                visit_date,
+                adults,
+                children,
+                total_amount,
+                contact_name,
+                booking_types(name, icon),
+                time_slots(slot_name,start_time,end_time)
+            """) \
             .eq("id", booking_id) \
             .execute()
 
@@ -2094,55 +2098,145 @@ def confirm_booking(
 
         booking = booking_res.data[0]
 
-        # 4. Email body
+        # 4. EMAIL BODY (PENDING)
         email_body = f"""
-        <h2>Booking Confirmed 🎉</h2>
+        <h2>Booking Received ⏳</h2>
 
         <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
         <p><b>Name:</b> {booking['contact_name']}</p>
         <p><b>Visit Date:</b> {booking['visit_date']}</p>
-        <p><b>Time Slot:</b> {booking['time_slots']['slot_name']} ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
+        <p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
+        ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
         <p><b>Adults:</b> {booking['adults']}</p>
         <p><b>Children:</b> {booking['children']}</p>
 
         <hr/>
         <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
-        <p><b>Payment:</b> Pay at counter</p>
+        <p><b>Status:</b> Pending admin confirmation</p>
 
         <br/>
-        <p>Thank you for booking with <b>Animal Farm</b> 🐄🌿</p>
+        <p>Your booking request is under review.</p>
+        <p>You will receive a confirmation email once approved by admin.</p>
+
+        <p>Thank you for choosing <b>Animal Farm</b> 🐄🌿</p>
         """
 
-        # 5. Generate PDF receipt
+        # 5. Generate PDF receipt (optional but kept as you wanted)
         pdf_path = generate_booking_receipt(booking)
 
-        # 6. Send email with PDF attachment (background)
-        try:
-            background_tasks.add_task(
-                send_email_with_attachment,
-                data.contact_email,
-                "Booking Confirmed - Animal Farm 🐄🌿",
-                email_body,
-                pdf_path
-            )
-            print("Booking email queued for:", data.contact_email)
-        except Exception as e:
-            print("Email scheduling failed:", e)
+        # 6. Send email with PDF attachment
+        background_tasks.add_task(
+            send_email_with_attachment,
+            data.contact_email,
+            "Booking Received - Pending Confirmation | Animal Farm 🐄🌿",
+            email_body,
+            pdf_path
+        )
 
         return {
-            "status": "success",
-            "message": "Booking confirmed",
+            "status": "pending",
+            "message": "Booking request received. Awaiting admin confirmation.",
             "booking_name": booking["booking_types"]["name"],
             "total_amount": total_amount
         }
 
     except Exception as e:
-        print("BOOKING CONFIRM ERROR 👉", e)
+        print("BOOKING REQUEST ERROR 👉", e)
 
         if "Slot full" in str(e):
             raise HTTPException(400, "Selected slot is full")
 
-        raise HTTPException(500, "Booking confirm failed")
+        raise HTTPException(500, "Booking request failed")
+
+
+# -------------------------
+# Confiirme booking by admin Booking Email API
+# -------------------------
+@app.post("/admin/bookings/{booking_id}/confirm", tags=["Admin"])
+def admin_confirm_booking(
+    booking_id: str,
+    background_tasks: BackgroundTasks,
+    current_user_id: str = Depends(get_current_admin)
+):
+    # Fetch booking
+    res = supabase_admin.table("bookings") \
+        .select("""
+            id,
+            status,
+            visit_date,
+            adults,
+            children,
+            total_amount,
+            contact_name,
+            contact_email,
+            booking_types(name, icon),
+            time_slots(slot_name,start_time,end_time)
+        """) \
+        .eq("id", booking_id) \
+        .single() \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking = res.data
+
+    # Already confirmed check
+    if booking["status"] == "confirmed":
+        return {
+            "status": "already_confirmed",
+            "message": "Booking already confirmed"
+        }
+
+    if booking["status"] == "cancelled":
+        raise HTTPException(400, "Cancelled booking cannot be confirmed")
+
+    # Update status → confirmed
+    supabase_admin.table("bookings") \
+        .update({
+            "status": "confirmed",
+            "confirmed_by": current_user_id,
+            "confirmed_at": datetime.utcnow().isoformat()
+        }) \
+        .eq("id", booking_id) \
+        .execute()
+
+    # Confirmation email body
+    email_body = f"""
+    <h2>Booking Confirmed 🎉</h2>
+
+    <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
+    <p><b>Name:</b> {booking['contact_name']}</p>
+    <p><b>Visit Date:</b> {booking['visit_date']}</p>
+    <p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
+    ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
+    <p><b>Adults:</b> {booking['adults']}</p>
+    <p><b>Children:</b> {booking['children']}</p>
+
+    <hr/>
+    <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
+    <p><b>Payment:</b> Pay at counter</p>
+
+    <br/>
+    <p>We look forward to welcoming you at <b>Animal Farm</b> 🐄🌿</p>
+    """
+
+    # Generate PDF
+    pdf_path = generate_booking_receipt(booking)
+
+    # Send confirmation email
+    background_tasks.add_task(
+        send_email_with_attachment,
+        booking["contact_email"],
+        "Booking Confirmed - Animal Farm 🐄🌿",
+        email_body,
+        pdf_path
+    )
+
+    return {
+        "status": "success",
+        "message": "Booking confirmed and email sent"
+    }
 
 
 
@@ -2299,4 +2393,303 @@ def admin_dashboard():
         # NEW DATA
         "online_bookings": online_count,
         "walkin_bookings": walkin_count
+    }
+
+
+# -------------------------
+# Admin Dashboard Filter API
+# ------------------------- 
+@app.get("/admin/bookings/filter", tags=["Admin"])
+def filter_bookings(
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+    booking_source: Optional[str] = None,   # online / walkin
+    booking_type_id: Optional[str] = None,
+    time_slot_id: Optional[str] = None,
+    payment_received: Optional[bool] = None,
+    status: Optional[str] = None,
+    current_user_id: str = Depends(get_current_admin)
+):
+    query = base_admin_booking_query()
+
+    # 🔹 Date filters (visit date)
+    if from_date:
+        query = query.gte("visit_date", from_date.isoformat())
+
+    if to_date:
+        query = query.lte("visit_date", to_date.isoformat())
+
+    # 🔹 Booking source
+    if booking_source:
+        query = query.eq("booking_source", booking_source)
+
+    # 🔹 Booking type
+    if booking_type_id:
+        query = query.eq("booking_type_id", booking_type_id)
+
+    # 🔹 Time slot
+    if time_slot_id:
+        query = query.eq("time_slot_id", time_slot_id)
+
+    # 🔹 Payment received
+    if payment_received is not None:
+        query = query.eq("payment_received", payment_received)
+
+    # 🔹 Booking status (confirmed / cancelled)
+    if status:
+        query = query.eq("status", status)
+
+    return query.execute()
+
+# -------------------------
+# Admin Export Reports API
+# -------------------------
+@app.get("/admin/bookings/export", tags=["Admin"])
+def export_bookings(
+    format: str = "xlsx",   # csv | xlsx
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+    booking_source: Optional[str] = None,
+    booking_type_id: Optional[str] = None,
+    time_slot_id: Optional[str] = None,
+    payment_received: Optional[bool] = None,
+    status: Optional[str] = None,
+    current_user_id: str = Depends(get_current_admin)
+):
+    query = base_admin_booking_query()
+
+    # 🔹 same filters as /filter
+    if from_date:
+        query = query.gte("visit_date", from_date.isoformat())
+    if to_date:
+        query = query.lte("visit_date", to_date.isoformat())
+    if booking_source:
+        query = query.eq("booking_source", booking_source)
+    if booking_type_id:
+        query = query.eq("booking_type_id", booking_type_id)
+    if time_slot_id:
+        query = query.eq("time_slot_id", time_slot_id)
+    if payment_received is not None:
+        query = query.eq("payment_received", payment_received)
+    if status:
+        query = query.eq("status", status)
+
+    bookings = query.execute().data
+
+# -------------------------
+# Admin CSV Export API
+# -------------------------
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Booking ID", "Visit Date", "Booking Source",
+            "Booking Type", "Time Slot",
+            "Adults", "Children", "Total Amount",
+            "Payment Received", "Status"
+        ])
+
+        for b in bookings:
+            writer.writerow([
+                b["id"],
+                b["visit_date"],
+                b.get("booking_source"),
+                b["booking_types"]["name"] if b.get("booking_types") else "",
+                b["time_slots"]["slot_name"] if b.get("time_slots") else "",
+                b["adults"],
+                b["children"],
+                b["total_amount"],
+                "YES" if b["payment_received"] else "NO",
+                b["status"]
+            ])
+
+        output.seek(0)
+
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode()),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=bookings_export.csv"
+            }
+        )
+
+# -------------------------
+# EXCEL EXPORT (DEFAULT)
+# -------------------------
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bookings"
+
+    ws.append([
+        "Booking ID", "Visit Date", "Booking Source",
+        "Booking Type", "Time Slot",
+        "Adults", "Children", "Total Amount",
+        "Payment Received", "Status"
+    ])
+
+    for b in bookings:
+        ws.append([
+            b["id"],
+            b["visit_date"],
+            b.get("booking_source"),
+            b["booking_types"]["name"] if b.get("booking_types") else "",
+            b["time_slots"]["slot_name"] if b.get("time_slots") else "",
+            b["adults"],
+            b["children"],
+            b["total_amount"],
+            "YES" if b["payment_received"] else "NO",
+            b["status"]
+        ])
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": "attachment; filename=bookings_export.xlsx"
+        }
+    )
+
+
+# -------------------------
+# Analytics Booking type API
+# -------------------------
+@app.get("/admin/analytics/booking-types", tags=["Admin"])
+def booking_type_distribution(
+    current_user_id: str = Depends(get_current_admin)
+):
+    res = supabase_admin.rpc(
+        "booking_type_distribution"
+    ).execute()
+
+    return {
+        "data": res.data
+    }
+
+
+# -------------------------
+# Analytics Booking trends API
+# -------------------------
+@app.get("/admin/analytics/booking-trends", tags=["Admin"])
+def booking_trends_analytics(
+    current_user_id: str = Depends(get_current_admin)
+):
+    """
+    Weekend vs Weekday booking trends
+    """
+
+    # Fetch only CONFIRMED bookings
+    res = supabase_admin.table("bookings") \
+        .select("visit_date") \
+        .eq("status", "confirmed") \
+        .execute()
+
+    bookings = res.data or []
+
+    if not bookings:
+        return {
+            "weekend_bookings": 0,
+            "weekday_bookings": 0,
+            "weekend_percentage": 0,
+            "weekday_percentage": 0,
+            "most_popular_day": None
+        }
+
+    weekend_count = 0
+    weekday_count = 0
+    day_counter = Counter()
+
+    # Process each booking
+    for b in bookings:
+        visit_date = datetime.fromisoformat(b["visit_date"])
+        day_name = visit_date.strftime("%A")  # Monday, Tuesday...
+
+        day_counter[day_name] += 1
+
+        # Saturday = 5, Sunday = 6
+        if visit_date.weekday() >= 5:
+            weekend_count += 1
+        else:
+            weekday_count += 1
+
+    total = weekend_count + weekday_count
+
+    # Percentages
+    weekend_percentage = round((weekend_count / total) * 100, 1)
+    weekday_percentage = round((weekday_count / total) * 100, 1)
+
+    # Most popular day
+    most_popular_day = day_counter.most_common(1)[0][0]
+
+    return {
+        "weekend_bookings": weekend_count,
+        "weekday_bookings": weekday_count,
+        "weekend_percentage": weekend_percentage,
+        "weekday_percentage": weekday_percentage,
+        "most_popular_day": most_popular_day
+    }
+
+
+# -------------------------
+# Admin Dashboard Analytics Revinue overview API
+# -------------------------
+@app.get("/admin/analytics/revenue-overview", tags=["Admin"])
+def revenue_overview(
+    current_user_id: str = Depends(get_current_admin)
+):
+    """
+    Monthly revenue breakdown (day-wise: Mon-Sun)
+    """
+
+    now = datetime.utcnow()
+
+    # Start of current month
+    start_of_month = now.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+    # Fetch PAID bookings of current month
+    res = supabase_admin.table("bookings") \
+        .select("visit_date, total_amount") \
+        .eq("payment_received", True) \
+        .gte("visit_date", start_of_month.date().isoformat()) \
+        .execute()
+
+    rows = res.data or []
+
+    # Prepare day-wise revenue map
+    day_map = {
+        "Mon": 0,
+        "Tue": 0,
+        "Wed": 0,
+        "Thu": 0,
+        "Fri": 0,
+        "Sat": 0,
+        "Sun": 0
+    }
+
+    total_revenue = 0
+
+    for r in rows:
+        visit_date = datetime.fromisoformat(r["visit_date"])
+        day_key = visit_date.strftime("%a")  # Mon, Tue, Wed...
+        amount = r["total_amount"] or 0
+
+        day_map[day_key] += amount
+        total_revenue += amount
+
+    # Round values (UI friendly)
+    for d in day_map:
+        day_map[d] = round(day_map[d], 2)
+
+    total_revenue = round(total_revenue, 2)
+
+    return {
+        "month": start_of_month.strftime("%B %Y"),
+        "total_revenue": total_revenue,
+        "day_wise_revenue": day_map
     }
