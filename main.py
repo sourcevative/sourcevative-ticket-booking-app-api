@@ -1243,6 +1243,7 @@ def admin_book_walkin(
             "p_preferred_contact": data.preferred_contact,
             "p_notes": data.notes,
             "p_created_by": current_user_id,
+            "p_addon_ids": data.addons or []
         }).execute()
 
         if not res.data:
