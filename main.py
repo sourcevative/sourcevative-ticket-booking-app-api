@@ -1,5 +1,6 @@
 import os
 import csv
+import io
 import uuid
 import smtplib
 import secrets
@@ -27,6 +28,7 @@ from openpyxl import Workbook
 from fastapi.responses import StreamingResponse
 from collections import Counter
 from collections import defaultdict
+from uuid import UUID
 
 
 
@@ -78,7 +80,7 @@ def ensure_tables():
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000",],  # Frontend URL
+    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],  # Frontend URL
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
@@ -1620,6 +1622,25 @@ def get_user_bookings(user_id: str):
         .eq("user_id", user_id) \
         .execute()
 
+def base_admin_booking_query():
+    return supabase_admin.table("bookings") \
+        .select("""
+            id,
+            visit_date,
+            status,
+            adults,
+            children,
+            total_amount,
+            payment_received,
+            booking_source,
+            booking_type_id,
+            time_slot_id,
+            booking_types(name),
+            time_slots(slot_name,start_time,end_time)
+        """) \
+        .order("created_at", desc=True)
+
+
 # -------------------------
 # Admin Show All Bookings API (ADMIN DASHBOARD LIST)
 # -------------------------
@@ -1645,40 +1666,6 @@ def admin_all_bookings():
         .execute()
 
     return res.data
-
-# -------------------------
-# Admin Single Booking Details API (View Details Modal)
-# -------------------------
-@app.get("/admin/bookings/{booking_id}", tags=["Admin"])
-def admin_booking_details(booking_id: str):
-
-    res = supabase_admin.table("bookings") \
-        .select("""
-            id,
-            visit_date,
-            status,
-            adults,
-            children,
-            total_amount,
-            payment_status,
-            payment_method,
-            contact_name,
-            contact_email,
-            contact_phone,
-            notes,
-            booking_types(name),
-            time_slots(slot_name,start_time,end_time)
-""") \
-        .eq("id", booking_id) \
-        .single() \
-        .execute()
-
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Booking not found")
-
-    return res.data
-
-
 
 # -------------------------
 # Admin Show Stats API
@@ -2468,47 +2455,52 @@ def admin_dashboard():
 # -------------------------
 # Admin Dashboard Filter API
 # ------------------------- 
+
 @app.get("/admin/bookings/filter", tags=["Admin"])
 def filter_bookings(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
-    booking_source: Optional[str] = None,   # online / walkin
-    booking_type_id: Optional[str] = None,
-    time_slot_id: Optional[str] = None,
+    booking_source: Optional[str] = None,
+    booking_type_id: Optional[UUID] = None,
+    time_slot_id: Optional[UUID] = None,
     payment_received: Optional[bool] = None,
     status: Optional[str] = None,
     current_user_id: str = Depends(get_current_admin)
 ):
-    query = base_admin_booking_query()
+    try:
+        query = base_admin_booking_query()
 
-    # 🔹 Date filters (visit date)
-    if from_date:
-        query = query.gte("visit_date", from_date.isoformat())
+        if from_date:
+            query = query.gte("visit_date", from_date.isoformat())
 
-    if to_date:
-        query = query.lte("visit_date", to_date.isoformat())
+        if to_date:
+            query = query.lte("visit_date", to_date.isoformat())
 
-    # 🔹 Booking source
-    if booking_source:
-        query = query.eq("booking_source", booking_source)
+        if booking_source:
+            query = query.eq("booking_source", booking_source)
 
-    # 🔹 Booking type
-    if booking_type_id:
-        query = query.eq("booking_type_id", booking_type_id)
+        if booking_type_id:
+            query = query.eq("booking_type_id", str(booking_type_id))
 
-    # 🔹 Time slot
-    if time_slot_id:
-        query = query.eq("time_slot_id", time_slot_id)
+        if time_slot_id:
+            query = query.eq("time_slot_id", str(time_slot_id))
 
-    # 🔹 Payment received
-    if payment_received is not None:
-        query = query.eq("payment_received", payment_received)
+        if payment_received is not None:
+            query = query.eq("payment_received", payment_received)
 
-    # 🔹 Booking status (confirmed / cancelled)
-    if status:
-        query = query.eq("status", status)
+        if status:
+            query = query.eq("status", status)
 
-    return query.execute()
+        response = query.execute()
+
+        if not response or response.data is None:
+            return []
+
+        return response.data
+
+    except Exception as e:
+        print("FILTER ERROR:", str(e))
+        raise HTTPException(status_code=500, detail="Filter failed")
 
 # -------------------------
 # Admin Export Reports API
@@ -2544,6 +2536,39 @@ def export_bookings(
         query = query.eq("status", status)
 
     bookings = query.execute().data
+
+    # -------------------------
+# Admin Single Booking Details API (View Details Modal)
+# -------------------------
+@app.get("/admin/bookings/{booking_id}", tags=["Admin"])
+def admin_booking_details(booking_id: UUID):
+
+    res = supabase_admin.table("bookings") \
+        .select("""
+            id,
+            visit_date,
+            status,
+            adults,
+            children,
+            total_amount,
+            payment_status,
+            payment_method,
+            contact_name,
+            contact_email,
+            contact_phone,
+            notes,
+            booking_types(name),
+            time_slots(slot_name,start_time,end_time)
+""") \
+        .eq("id", booking_id) \
+        .single() \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    return res.data
+
 
 # -------------------------
 # Admin CSV Export API
