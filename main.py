@@ -1634,6 +1634,9 @@ def base_admin_booking_query():
             total_amount,
             payment_received,
             booking_source,
+            contact_name,      
+            contact_email,     
+            contact_phone,     
             booking_type_id,
             time_slot_id,
             booking_types(name),
@@ -2456,15 +2459,14 @@ def admin_dashboard():
 # -------------------------
 # Admin Dashboard Filter API
 # ------------------------- 
-
 @app.get("/admin/bookings/filter", tags=["Admin"])
 def filter_bookings(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
     booking_source: Optional[str] = None,
-    booking_type_id: Optional[UUID] = None,
-    time_slot_id: Optional[UUID] = None,
-    payment_received: Optional[bool] = None,
+    booking_type_id: Optional[str] = None,
+    time_slot_id: Optional[str] = None,
+    payment_received: Optional[str] = None,   # 🔥 CHANGED
     status: Optional[str] = None,
     current_user_id: str = Depends(get_current_admin)
 ):
@@ -2481,46 +2483,45 @@ def filter_bookings(
             query = query.eq("booking_source", booking_source)
 
         if booking_type_id:
-            query = query.eq("booking_type_id", str(booking_type_id))
+            query = query.eq("booking_type_id", booking_type_id)
 
         if time_slot_id:
-            query = query.eq("time_slot_id", str(time_slot_id))
+            query = query.eq("time_slot_id", time_slot_id)
 
+        # 🔥 IMPORTANT FIX
         if payment_received is not None:
-            query = query.eq("payment_received", payment_received)
+            if payment_received.lower() == "true":
+                query = query.eq("payment_received", True)
+            elif payment_received.lower() == "false":
+                query = query.eq("payment_received", False)
 
         if status:
             query = query.eq("status", status)
 
-        response = query.execute()
-
-        if not response or response.data is None:
-            return []
-
-        return response.data
+        res = query.execute()
+        return res.data or []
 
     except Exception as e:
-        print("FILTER ERROR:", str(e))
-        raise HTTPException(status_code=500, detail="Filter failed")
+        print("FILTER ERROR FULL 👉", repr(e))
+        raise HTTPException(500, str(e))
 
 # -------------------------
 # Admin Export Reports API
 # -------------------------
 @app.get("/admin/bookings/export", tags=["Admin"])
 def export_bookings(
-    format: str = "xlsx",   # csv | xlsx
+    format: str = "xlsx",
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
     booking_source: Optional[str] = None,
     booking_type_id: Optional[str] = None,
     time_slot_id: Optional[str] = None,
-    payment_received: Optional[bool] = None,
+    payment_received: Optional[str] = None,
     status: Optional[str] = None,
     current_user_id: str = Depends(get_current_admin)
 ):
     query = base_admin_booking_query()
 
-    # 🔹 same filters as /filter
     if from_date:
         query = query.gte("visit_date", from_date.isoformat())
     if to_date:
@@ -2532,13 +2533,87 @@ def export_bookings(
     if time_slot_id:
         query = query.eq("time_slot_id", time_slot_id)
     if payment_received is not None:
-        query = query.eq("payment_received", payment_received)
+        query = query.eq("payment_received", payment_received.lower() == "true")
     if status:
         query = query.eq("status", status)
 
-    bookings = query.execute().data
+    bookings = query.execute().data or []
 
-    # -------------------------
+    # ================= CSV =================
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Booking ID", "Visit Date", "Booking Source",
+            "Booking Type", "Time Slot",
+            "Adults", "Children", "Total Amount",
+            "Payment Received", "Status"
+        ])
+
+        for b in bookings:
+            writer.writerow([
+                b["id"],
+                b["visit_date"],
+                b.get("booking_source"),
+                b["booking_types"]["name"] if b.get("booking_types") else "",
+                b["time_slots"]["slot_name"] if b.get("time_slots") else "",
+                b["adults"],
+                b["children"],
+                b["total_amount"],
+                "YES" if b["payment_received"] else "NO",
+                b["status"]
+            ])
+
+        output.seek(0)
+
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode("utf-8")),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=bookings_export.csv"
+            }
+        )
+
+    # ================= XLSX =================
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bookings"
+
+    ws.append([
+        "Booking ID", "Visit Date", "Booking Source",
+        "Booking Type", "Time Slot",
+        "Adults", "Children", "Total Amount",
+        "Payment Received", "Status"
+    ])
+
+    for b in bookings:
+        ws.append([
+            b["id"],
+            b["visit_date"],
+            b.get("booking_source"),
+            b["booking_types"]["name"] if b.get("booking_types") else "",
+            b["time_slots"]["slot_name"] if b.get("time_slots") else "",
+            b["adults"],
+            b["children"],
+            b["total_amount"],
+            "YES" if b["payment_received"] else "NO",
+            b["status"]
+        ])
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": "attachment; filename=bookings_export.xlsx"
+        }
+    )
+    
+# -------------------------
 # Admin Single Booking Details API (View Details Modal)
 # -------------------------
 @app.get("/admin/bookings/{booking_id}", tags=["Admin"])
@@ -2788,3 +2863,87 @@ def revenue_overview(
         "total_revenue": total_revenue,
         "day_wise_revenue": day_map
     }
+
+# -------------------------
+# Admin Dashboard Capacity change API
+# -------------------------
+@app.get("/admin/capacity", tags=["Admin"])
+def get_capacity_data(
+    current_user_id: str = Depends(get_current_admin)
+):
+    try:
+        booking_types = supabase_admin.table("booking_types") \
+            .select("id, name") \
+            .eq("is_active", True) \
+            .execute().data
+
+        final_result = []
+
+        for bt in booking_types:
+
+            slots = supabase_admin.table("time_slots") \
+                .select("id, slot_name, capacity") \
+                .eq("booking_type_id", bt["id"]) \
+                .eq("is_active", True) \
+                .execute().data
+
+            slot_list = []
+
+            for slot in slots:
+                bookings = supabase_admin.table("bookings") \
+                    .select("id") \
+                    .eq("time_slot_id", slot["id"]) \
+                    .eq("status", "confirmed") \
+                    .execute().data
+
+                slot_list.append({
+                    "slot_id": slot["id"],
+                    "slot_name": slot["slot_name"],
+                    "capacity": slot["capacity"],
+                    "booked": len(bookings)
+                })
+
+            final_result.append({
+                "booking_type_id": bt["id"],
+                "booking_type_name": bt["name"],
+                "slots": slot_list
+            })
+
+        return final_result
+
+    except Exception as e:
+        print("CAPACITY ERROR 👉", e)
+        raise HTTPException(500, "Capacity fetch failed")
+
+
+# 🔥 हे GET च्या बाहेर आहे
+@app.patch("/admin/time-slot/{slot_id}/capacity", tags=["Admin"])
+def update_slot_capacity(
+    slot_id: str,
+    payload: dict,
+    current_user_id: str = Depends(get_current_admin)
+):
+    try:
+        new_capacity = payload.get("capacity")
+
+        if new_capacity is None:
+            raise HTTPException(400, "Capacity is required")
+
+        slot = supabase_admin.table("time_slots") \
+            .select("id") \
+            .eq("id", slot_id) \
+            .execute().data
+
+        if not slot:
+            raise HTTPException(404, "Slot not found")
+
+        supabase_admin.table("time_slots") \
+            .update({"capacity": new_capacity}) \
+            .eq("id", slot_id) \
+            .execute()
+
+        return {"message": "Capacity updated successfully"}
+
+    except Exception as e:
+        print("CAPACITY UPDATE ERROR 👉", e)
+        raise HTTPException(500, "Capacity update failed")
