@@ -1827,10 +1827,13 @@ def admin_all_bookings():
             adults,
             children,
             total_amount,
-            payment_status,
-            created_at,
-            contact_name,
-            contact_email,
+            payment_received,
+            booking_source,
+            contact_name,      
+            contact_email,     
+            contact_phone,     
+            booking_type_id,
+            time_slot_id,
             booking_types(name),
             time_slots(slot_name,start_time,end_time)
         """) \
@@ -2740,62 +2743,56 @@ def admin_dashboard():
 def filter_bookings(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
-    booking_source: Optional[str] = None,   # online / walkin
+    booking_source: Optional[str] = None,
     booking_type_id: Optional[str] = None,
     time_slot_id: Optional[str] = None,
-    payment_received: Optional[bool] = None,
+    payment_received: Optional[str] = None,   # 🔥 CHANGED
     status: Optional[str] = None,
     current_user_id: str = Depends(get_current_admin)
 ):
     query = base_admin_booking_query()
 
-    # 🔹 Date filters (visit date)
-    if from_date:
-        query = query.gte("visit_date", from_date.isoformat())
+        if booking_type_id:
+            query = query.eq("booking_type_id", booking_type_id)
 
-    if to_date:
-        query = query.lte("visit_date", to_date.isoformat())
+        if time_slot_id:
+            query = query.eq("time_slot_id", time_slot_id)
 
-    # 🔹 Booking source
-    if booking_source:
-        query = query.eq("booking_source", booking_source)
+        # 🔥 IMPORTANT FIX
+        if payment_received is not None:
+            if payment_received.lower() == "true":
+                query = query.eq("payment_received", True)
+            elif payment_received.lower() == "false":
+                query = query.eq("payment_received", False)
 
     # 🔹 Booking type
     if booking_type_id:
         query = query.eq("booking_type_id", booking_type_id)
 
-    # 🔹 Time slot
-    if time_slot_id:
-        query = query.eq("time_slot_id", time_slot_id)
+        res = query.execute()
+        return res.data or []
 
-    # 🔹 Payment received
-    if payment_received is not None:
-        query = query.eq("payment_received", payment_received)
-
-    # 🔹 Booking status (confirmed / cancelled)
-    if status:
-        query = query.eq("status", status)
-
-    return query.execute()
+    except Exception as e:
+        print("FILTER ERROR FULL 👉", repr(e))
+        raise HTTPException(500, str(e))
 
 # -------------------------
 # Admin Export Reports API
 # -------------------------
 @app.get("/admin/bookings/export", tags=["Admin"])
 def export_bookings(
-    format: str = "xlsx",   # csv | xlsx
+    format: str = "xlsx",
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
     booking_source: Optional[str] = None,
     booking_type_id: Optional[str] = None,
     time_slot_id: Optional[str] = None,
-    payment_received: Optional[bool] = None,
+    payment_received: Optional[str] = None,
     status: Optional[str] = None,
     current_user_id: str = Depends(get_current_admin)
 ):
     query = base_admin_booking_query()
 
-    # 🔹 same filters as /filter
     if from_date:
         query = query.gte("visit_date", from_date.isoformat())
     if to_date:
@@ -2807,11 +2804,118 @@ def export_bookings(
     if time_slot_id:
         query = query.eq("time_slot_id", time_slot_id)
     if payment_received is not None:
-        query = query.eq("payment_received", payment_received)
+        query = query.eq("payment_received", payment_received.lower() == "true")
     if status:
         query = query.eq("status", status)
 
-    bookings = query.execute().data
+    bookings = query.execute().data or []
+
+    # ================= CSV =================
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Booking ID", "Visit Date", "Booking Source",
+            "Booking Type", "Time Slot",
+            "Adults", "Children", "Total Amount",
+            "Payment Received", "Status"
+        ])
+
+        for b in bookings:
+            writer.writerow([
+                b["id"],
+                b["visit_date"],
+                b.get("booking_source"),
+                b["booking_types"]["name"] if b.get("booking_types") else "",
+                b["time_slots"]["slot_name"] if b.get("time_slots") else "",
+                b["adults"],
+                b["children"],
+                b["total_amount"],
+                "YES" if b["payment_received"] else "NO",
+                b["status"]
+            ])
+
+        output.seek(0)
+
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode("utf-8")),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=bookings_export.csv"
+            }
+        )
+
+    # ================= XLSX =================
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bookings"
+
+    ws.append([
+        "Booking ID", "Visit Date", "Booking Source",
+        "Booking Type", "Time Slot",
+        "Adults", "Children", "Total Amount",
+        "Payment Received", "Status"
+    ])
+
+    for b in bookings:
+        ws.append([
+            b["id"],
+            b["visit_date"],
+            b.get("booking_source"),
+            b["booking_types"]["name"] if b.get("booking_types") else "",
+            b["time_slots"]["slot_name"] if b.get("time_slots") else "",
+            b["adults"],
+            b["children"],
+            b["total_amount"],
+            "YES" if b["payment_received"] else "NO",
+            b["status"]
+        ])
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": "attachment; filename=bookings_export.xlsx"
+        }
+    )
+    
+# -------------------------
+# Admin Single Booking Details API (View Details Modal)
+# -------------------------
+@app.get("/admin/bookings/{booking_id}", tags=["Admin"])
+def admin_booking_details(booking_id: UUID):
+
+    res = supabase_admin.table("bookings") \
+        .select("""
+            id,
+            visit_date,
+            status,
+            adults,
+            children,
+            total_amount,
+            payment_status,
+            payment_method,
+            contact_name,
+            contact_email,
+            contact_phone,
+            notes,
+            booking_types(name),
+            time_slots(slot_name,start_time,end_time)
+""") \
+        .eq("id", booking_id) \
+        .single() \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    return res.data
+
 
 # -------------------------
 # Admin CSV Export API
@@ -3032,211 +3136,85 @@ def revenue_overview(
     }
 
 # -------------------------
-# Admin Cash recieved API
+# Admin Dashboard Capacity change API
 # -------------------------
-@app.post("/admin/bookings/{booking_id}/collect-cash", tags=["Admin"])
-def collect_cash_payment(
-    booking_id: str,
-    background_tasks: BackgroundTasks,
+@app.get("/admin/capacity", tags=["Admin"])
+def get_capacity_data(
     current_user_id: str = Depends(get_current_admin)
 ):
-    # 1️⃣ Fetch booking (basic validation)
-    res = supabase_admin.table("bookings") \
-        .select("""
-            id,
-            contact_email,
-            contact_name,
-            payment_received,
-            payment_method,
-            visit_date
-        """) \
-        .eq("id", booking_id) \
-        .execute()
+    try:
+        booking_types = supabase_admin.table("booking_types") \
+            .select("id, name") \
+            .eq("is_active", True) \
+            .execute().data
 
-    if not res.data:
-        raise HTTPException(404, "Booking not found")
+        final_result = []
 
-    booking_basic = res.data[0]
+        for bt in booking_types:
 
-    # 2️⃣ Validation
-    if booking_basic["payment_received"]:
-        raise HTTPException(400, "Payment already collected")
+            slots = supabase_admin.table("time_slots") \
+                .select("id, slot_name, capacity") \
+                .eq("booking_type_id", bt["id"]) \
+                .eq("is_active", True) \
+                .execute().data
 
-    if booking_basic["payment_method"] != "cash":
-        raise HTTPException(400, "Payment method is not cash")
+            slot_list = []
 
-    # 3️⃣ Update booking (mark cash received)
-    supabase_admin.table("bookings") \
-        .update({
-            "payment_received": True,
-            "payment_collected_at": datetime.utcnow().isoformat(),
-            "payment_collected_by": current_user_id
-        }) \
-        .eq("id", booking_id) \
-        .execute()
+            for slot in slots:
+                bookings = supabase_admin.table("bookings") \
+                    .select("id") \
+                    .eq("time_slot_id", slot["id"]) \
+                    .eq("status", "confirmed") \
+                    .execute().data
 
-    # 4️⃣ Fetch FULL booking (PDF + email साठी)
-    booking = supabase_admin.table("bookings") \
-        .select("""
-            id,
-            visit_date,
-            adults,
-            children,
-            total_amount,
-            contact_name,
-            contact_email,
-            booking_types(name, icon),
-            time_slots(slot_name,start_time,end_time)
-        """) \
-        .eq("id", booking_id) \
-        .single() \
-        .execute().data
+                slot_list.append({
+                    "slot_id": slot["id"],
+                    "slot_name": slot["slot_name"],
+                    "capacity": slot["capacity"],
+                    "booked": len(bookings)
+                })
 
-    # 5️⃣ Generate NEW Payment Received PDF
-    pdf_path = generate_payment_received_receipt(booking)
+            final_result.append({
+                "booking_type_id": bt["id"],
+                "booking_type_name": bt["name"],
+                "slots": slot_list
+            })
 
-    # 6️⃣ Send Payment Received email + PDF (background)
-    background_tasks.add_task(
-        send_payment_received_email_with_pdf,
-        booking,
-        pdf_path
-    )
+        return final_result
 
-    return {
-        "status": "success",
-        "message": "Cash payment collected and payment receipt sent successfully"
-    }
+    except Exception as e:
+        print("CAPACITY ERROR 👉", e)
+        raise HTTPException(500, "Capacity fetch failed")
 
 
-# -------------------------
-# Admin Cash recieved API
-# -------------------------
-def generate_payment_received_receipt(booking):
-    os.makedirs("receipts", exist_ok=True)
-    filename = f"receipts/payment_received_{booking['id']}.pdf"
+# 🔥 हे GET च्या बाहेर आहे
+@app.patch("/admin/time-slot/{slot_id}/capacity", tags=["Admin"])
+def update_slot_capacity(
+    slot_id: str,
+    payload: dict,
+    current_user_id: str = Depends(get_current_admin)
+):
+    try:
+        new_capacity = payload.get("capacity")
 
-    # ✅ ADDON BREAKDOWN INSIDE FUNCTION
-    addon_lines, addon_total = get_booking_addon_breakdown(booking["id"])
+        if new_capacity is None:
+            raise HTTPException(400, "Capacity is required")
 
-    c = canvas.Canvas(filename, pagesize=A4)
+        slot = supabase_admin.table("time_slots") \
+            .select("id") \
+            .eq("id", slot_id) \
+            .execute().data
 
-    # Header
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, 800, "Payment Received ✅")
+        if not slot:
+            raise HTTPException(404, "Slot not found")
 
-    c.setFont("Helvetica", 11)
-    y = 760
+        supabase_admin.table("time_slots") \
+            .update({"capacity": new_capacity}) \
+            .eq("id", slot_id) \
+            .execute()
 
-    icon = booking.get("booking_types", {}).get("icon", "")
+        return {"message": "Capacity updated successfully"}
 
-    c.drawString(50, y, f"Booking: {icon} {booking['booking_types']['name']}")
-    y -= 20
-
-    c.drawString(50, y, f"Name: {booking['contact_name']}")
-    y -= 20
-
-    c.drawString(50, y, f"Visit Date: {booking['visit_date']}")
-    y -= 20
-
-    c.drawString(
-        50,
-        y,
-        f"Time Slot: {booking['time_slots']['slot_name']} "
-        f"({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})"
-    )
-    y -= 20
-
-    c.drawString(50, y, f"Adults: {booking['adults']}")
-    y -= 20
-
-    c.drawString(50, y, f"Children: {booking['children']}")
-
-    # Divider
-    y -= 30
-    c.line(50, y, 550, y)
-    y -= 25
-
-    # ✅ ADDONS IN PDF
-    if addon_lines:
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(50, y, "Add-ons")
-        y -= 20
-
-    c.setFont("Helvetica", 11)
-
-    for a in addon_lines:
-        c.drawString(
-            60,
-            y,
-            f"• {a['name']} (₹{a['price']} × {a['quantity']}) = ₹{a['total']}"
-    )
-    y -= 18   # inside loop only
-
-    # ⬇️ loop end
-    y -= 10
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(50, y, f"Add-ons Total: ₹{addon_total}")
-    y -= 25
-
-    c.line(50, y, 550, y)
-    y -= 25
-
-    # Total
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y, f"Total Amount Paid: ₹{booking['total_amount']}")
-    y -= 25
-
-    c.setFont("Helvetica", 11)
-    c.drawString(50, y, "Payment Status: Cash Collected ✅")
-    y -= 30
-
-    c.setFont("Helvetica-Oblique", 10)
-    c.drawString(50, y, "Thank you for visiting Animal Farm 🐄🌿")
-    y -= 15
-    c.drawString(50, y, "We hope you had a wonderful experience with us.")
-
-    c.save()
-    return filename
-
-
-def send_payment_received_email_with_pdf(booking, pdf_path):
-    subject = "Payment Received - Animal Farm 🐄🌿"
-
-    addon_lines, addon_total = get_booking_addon_breakdown(booking["id"])
-
-    addons_html = ""
-    if addon_lines:
-        addons_html = "<h4>Add-ons</h4><ul>"
-        for a in addon_lines:
-            addons_html += (
-                f"<li>{a['name']} "
-                f"(₹{a['price']} × {a['quantity']}) = ₹{a['total']}</li>"
-            )
-        addons_html += "</ul>"
-        addons_html += f"<p><b>Add-ons Total:</b> ₹{addon_total}</p>"
-
-    body = f"""
-    <h2>Payment Received ✅</h2>
-
-    <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
-    <p><b>Name:</b> {booking['contact_name']}</p>
-    <p><b>Visit Date:</b> {booking['visit_date']}</p>
-
-    <hr/>
-
-    {addons_html}
-
-    <hr/>
-
-    <p><b>Total Amount Paid:</b> ₹{booking['total_amount']}</p>
-    <p><b>Payment Status:</b> Cash Collected ✅</p>
-
-    <p>Thank you for visiting <b>Animal Farm</b> 🐄🌿</p>
-    """
-
-    send_email_with_attachment(
-        booking["contact_email"],
-        subject,
-        body,
-        pdf_path
-    )
+    except Exception as e:
+        print("CAPACITY UPDATE ERROR 👉", e)
+        raise HTTPException(500, "Capacity update failed")
