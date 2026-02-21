@@ -1,6 +1,5 @@
 import os
 import csv
-import io
 import uuid
 import smtplib
 import secrets
@@ -28,7 +27,6 @@ from openpyxl import Workbook
 from fastapi.responses import StreamingResponse
 from collections import Counter
 from collections import defaultdict
-from uuid import UUID
 
 
 
@@ -80,7 +78,7 @@ def ensure_tables():
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],  # Frontend URL
+    allow_origins=["http://localhost:3000",],  # Frontend URL
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
@@ -1062,19 +1060,25 @@ def get_current_admin(current_user_id: str = Depends(get_current_user)):
 
     return current_user_id
 
+# -------------------------
+# Booking Addon Item (MUST BE ABOVE BookingRequest)
+# -------------------------
+class BookingAddonItem(BaseModel):
+    addon_id: str
+    quantity: int = Field(gt=0) 
 
 # -------------------------
 # User Book Ticket API
 # -------------------------
 class BookingRequest(BaseModel):
-    # user_id: str
     booking_type_id: str
     time_slot_id: str
     visit_date: date
 
     adults: int
     children: int
-    addons: list[str] = []
+
+    addons: list[BookingAddonItem] = []
 
     contact_name: str
     contact_email: str
@@ -1082,6 +1086,32 @@ class BookingRequest(BaseModel):
 
     preferred_contact: str | None = "email"
     notes: str | None = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "booking_type_id": "btype-123",
+                "time_slot_id": "slot-123",
+                "visit_date": "2026-02-20",
+                "adults": 2,
+                "children": 1,
+                "addons": [
+                    {
+                        "addon_id": "addon-lunch",
+                        "quantity": 2
+                    },
+                    {
+                        "addon_id": "addon-water",
+                        "quantity": 3
+                    }
+                ],
+                "contact_name": "Test User",
+                "contact_email": "test@mail.com",
+                "contact_phone": "9999999999",
+                "preferred_contact": "email",
+                "notes": "test booking"
+            }
+        }
 
 
 # -------------------------
@@ -1091,7 +1121,26 @@ class PriceRequest(BaseModel):
     booking_type_id: str
     adults: int
     children: int
-    addons: list[str] 
+    addons: list[BookingAddonItem] = []
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "booking_type_id": "btype-123",
+                "adults": 2,
+                "children": 1,
+                "addons": [
+                    {
+                        "addon_id": "addon-lunch",
+                        "quantity": 2
+                    },
+                    {
+                        "addon_id": "addon-water",
+                        "quantity": 1
+                    }
+                ]
+            }
+        }
 
 
 class UpdateAddonRequest(BaseModel):
@@ -1100,23 +1149,45 @@ class UpdateAddonRequest(BaseModel):
     price: Optional[float] = Field(None, gt=0)
     is_active: Optional[bool] = None
 
+# -------------------------
+# Admin Create Addon (Booking-type specific) ✅ NEW
+# -------------------------
+class CreateAddonRequest(BaseModel):
+    booking_type_id: str
+    name: str
+    description: str
+    price: float = Field(gt=0)
+
 @app.post("/admin/addon", tags=["Admin"])
-def create_addon(name: str, description: str, price: float):
-    # Use admin client to bypass RLS policies
+def create_addon(
+    data: CreateAddonRequest,
+    current_user_id: str = Depends(get_current_admin)
+):
+    # validate booking type exists
+    bt = supabase_admin.table("booking_types") \
+        .select("id") \
+        .eq("id", data.booking_type_id) \
+        .execute()
+
+    if not bt.data:
+        raise HTTPException(404, "Booking type not found")
+
     return supabase_admin.table("addons").insert({
-        "name": name,
-        "description": description,
-        "price": price,
-        "is_active": True 
+        "booking_type_id": data.booking_type_id,
+        "name": data.name,
+        "description": data.description,
+        "price": data.price,
+        "is_active": True
     }).execute()
 
 # -------------------------
 # Adons Show User API
 # ------------------------- 
-@app.get("/addons", tags=["User"])
-def get_addons():
-    return supabase_admin.table("addons") \
-        .select("*") \
+@app.get("/addons/{booking_type_id}", tags=["User"])
+def get_addons_by_booking_type(booking_type_id: str):
+    return supabase.table("addons") \
+        .select("id, name, description, price") \
+        .eq("booking_type_id", booking_type_id) \
         .eq("is_active", True) \
         .execute()
 
@@ -1143,7 +1214,58 @@ def toggle_addon(addon_id: str, is_active: bool):
         "status": "success",
         "message": f"Addon {'activated' if is_active else 'deactivated'}"
     }
+@app.post("/admin/bookings/{booking_id}/addons", tags=["Admin"])
+def admin_edit_booking_addons(
+    booking_id: str,
+    addons: list[BookingAddonItem],
+    current_user_id: str = Depends(get_current_admin)
+):
+    # 1️⃣ Fetch booking
+    booking = supabase_admin.table("bookings") \
+        .select("id, status, booking_type_id, adults, children") \
+        .eq("id", booking_id) \
+        .single() \
+        .execute().data
 
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+
+    if booking["status"] != "confirmed":
+        raise HTTPException(400, "Only confirmed bookings can be edited by admin")
+
+    # 2️⃣ Remove old addons
+    supabase_admin.table("booking_addons") \
+        .delete() \
+        .eq("booking_id", booking_id) \
+        .execute()
+
+    # 3️⃣ Insert new addons (WITH quantity)
+    for addon in addons:
+        supabase_admin.table("booking_addons").insert({
+            "booking_id": booking_id,
+            "addon_id": addon.addon_id,
+            "quantity": addon.quantity
+        }).execute()
+
+    # 4️⃣ Recalculate total
+    price = calculate_price_internal(
+        booking["booking_type_id"],
+        booking["adults"],
+        booking["children"],
+        addons
+    )
+
+    supabase_admin.table("bookings") \
+        .update({"total_amount": price["total"]}) \
+        .eq("id", booking_id) \
+        .execute()
+
+    return {
+        "status": "success",
+        "message": "Add-ons updated by admin",
+        "new_total": price["total"]
+    } 
+    
 # -------------------------
 # Admin Edit Addons perticular field API
 # ------------------------- 
@@ -1214,44 +1336,70 @@ def admin_book_walkin(
     background_tasks: BackgroundTasks,
     current_user_id: str = Depends(get_current_admin)
 ):
-
     try:
         print("🔥 WALKIN API HIT")
         print("🔥 CURRENT ADMIN ID:", current_user_id)
 
-        # Price calculation
+        # 1️⃣ PRICE CALCULATION (qty-aware)
         price = calculate_price_internal(
             data.booking_type_id,
             data.adults,
             data.children,
             data.addons
         )
-
         total_amount = round(price["total"], 2)
 
-        #  Create walk-in booking via RPC
-        res = supabase_admin.rpc("create_walkin_booking", {
-            "p_name": data.contact_name,
-            "p_phone": data.contact_phone,
-            "p_email": data.contact_email,
-            "p_booking_type_id": data.booking_type_id,
-            "p_time_slot_id": data.time_slot_id,
-            "p_visit_date": data.visit_date.isoformat(),
-            "p_adults": data.adults,
-            "p_children": data.children,
-            "p_total_amount": total_amount,
-            "p_preferred_contact": data.preferred_contact,
-            "p_notes": data.notes,
-            "p_created_by": current_user_id,
-            "p_addon_ids": data.addons or []
-        }).execute()
+        # 2️⃣ CREATE WALK-IN BOOKING (RPC)
+        res = supabase_admin.rpc(
+            "create_walkin_booking",
+            {
+                "p_name": data.contact_name,
+                "p_phone": data.contact_phone,
+                "p_email": data.contact_email,
+                "p_booking_type_id": data.booking_type_id,
+                "p_time_slot_id": data.time_slot_id,
+                "p_visit_date": data.visit_date.isoformat(),
+                "p_adults": data.adults,
+                "p_children": data.children,
+                "p_total_amount": total_amount,
+                "p_preferred_contact": data.preferred_contact,
+                "p_notes": data.notes,
+                "p_created_by": current_user_id,
+            }
+        ).execute()
 
         if not res.data:
             raise HTTPException(500, "Walk-in booking failed")
 
         booking_id = res.data
 
-        #  Fetch booking details for email + PDF
+        # 3️⃣ SAVE ADDONS WITH QUANTITY
+        if data.addons:
+            for addon in data.addons:
+                supabase_admin.table("booking_addons").insert({
+                    "booking_id": booking_id,
+                    "addon_id": addon.addon_id,
+                    "quantity": addon.quantity
+                }).execute()
+
+        # 4️⃣ FETCH ADDON BREAKDOWN
+        addon_lines, addon_total = get_booking_addon_breakdown(booking_id)
+
+        # 🔹 BUILD ADDONS HTML  ✅ (THIS WAS MISSING)
+        addons_html = ""
+        if addon_lines:
+            addons_html = "<h4>Add-ons</h4><ul>"
+            for a in addon_lines:
+                addons_html += (
+                    f"<li>{a['name']} "
+                    f"(₹{a['price']} × {a['quantity']}) = ₹{a['total']}</li>"
+                )
+            addons_html += "</ul>"
+            addons_html += f"<p><b>Add-ons Total:</b> ₹{addon_total}</p>"
+        else:
+            addons_html = "<p><i>No add-ons selected</i></p>"
+
+        # 5️⃣ FETCH BOOKING DETAILS (EMAIL + PDF)
         booking_res = supabase.table("bookings") \
             .select("""
                 id,
@@ -1272,30 +1420,36 @@ def admin_book_walkin(
 
         booking = booking_res.data[0]
 
-        #  Email body
+        # 6️⃣ EMAIL BODY
         email_body = f"""
-        <h2>Booking Confirmed 🎉</h2>
+<h2>Booking Confirmed 🎉</h2>
 
-        <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
-        <p><b>Name:</b> {booking['contact_name']}</p>
-        <p><b>Visit Date:</b> {booking['visit_date']}</p>
-        <p><b>Time Slot:</b> {booking['time_slots']['slot_name']} 
-        ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
-        <p><b>Adults:</b> {booking['adults']}</p>
-        <p><b>Children:</b> {booking['children']}</p>
+<p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
+<p><b>Name:</b> {booking['contact_name']}</p>
+<p><b>Visit Date:</b> {booking['visit_date']}</p>
+<p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
+({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
 
-        <hr/>
-        <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
-        <p><b>Payment:</b> Cash (Pay at counter)</p>
+<p><b>Adults:</b> {booking['adults']}</p>
+<p><b>Children:</b> {booking['children']}</p>
 
-        <br/>
-        <p>Thank you for booking with <b>Animal Farm</b> 🐄🌿</p>
-        """
+<hr/>
 
-        #  Generate PDF receipt
+{addons_html}
+
+<hr/>
+
+<p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
+<p><b>Payment:</b> Cash (Pay at counter)</p>
+
+<br/>
+<p>Thank you for booking with <b>Animal Farm</b> 🐄🌿</p>
+"""
+
+        # 7️⃣ GENERATE PDF
         pdf_path = generate_booking_receipt(booking)
 
-        #  Send email in background with attachment
+        # 8️⃣ SEND EMAIL (BACKGROUND)
         background_tasks.add_task(
             send_email_with_attachment,
             booking["contact_email"],
@@ -1314,7 +1468,6 @@ def admin_book_walkin(
     except Exception as e:
         print("WALKIN BOOKING ERROR 👉", e)
         raise HTTPException(500, "Walk-in booking failed")
-
 
 # -------------------------
 # Check Booking mode API
@@ -1342,54 +1495,49 @@ def booking_source_stats():
 # -------------------------
 class BookingAddonRequest(BaseModel):
     booking_id: str
-    addon_ids: list[str]
+    addon_ids: list[BookingAddonItem]
 
 @app.post("/booking/addons", tags=["User"])
 def add_addons_to_booking(data: BookingAddonRequest):
-    # Validate that the booking exists
+
+    # 1️⃣ Validate booking exists
     booking_check = supabase.table("bookings") \
-        .select("id") \
+        .select("id, status") \
         .eq("id", data.booking_id) \
+        .single() \
         .execute()
-    
+
     if not booking_check.data:
         raise HTTPException(
-            status_code=404, 
+            status_code=404,
             detail=f"Booking with ID {data.booking_id} not found"
         )
-    
-    # Validate that all addon_ids exist (if addons are provided)
-    if data.addon_ids:
-        addons_check = supabase.table("addons") \
-            .select("id") \
-            .in_("id", data.addon_ids) \
-            .execute()
-        
-        existing_addon_ids = {addon["id"] for addon in addons_check.data}
-        missing_addon_ids = set(data.addon_ids) - existing_addon_ids
-        
-        if missing_addon_ids:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Addons not found: {', '.join(missing_addon_ids)}"
-            )
-    
-    # Delete previous addons (if user edits)
+
+    # 🔒 2️⃣ LOCK AFTER CONFIRM
+    if booking_check.data["status"] == "confirmed":
+        raise HTTPException(
+            status_code=403,
+            detail="Add-ons cannot be modified after booking confirmation"
+        )
+
+    # 3️⃣ Delete old addons
     supabase.table("booking_addons") \
         .delete() \
         .eq("booking_id", data.booking_id) \
         .execute()
 
-    # Insert new addons
-    if data.addon_ids:
-        for addon_id in data.addon_ids:
-            supabase.table("booking_addons").insert({
-                "booking_id": data.booking_id,
-                "addon_id": addon_id
-            }).execute()
+    # 4️⃣ Insert new addons WITH quantity
+    for addon in data.addon_ids:
+        supabase.table("booking_addons").insert({
+            "booking_id": data.booking_id,
+            "addon_id": addon.addon_id,
+            "quantity": addon.quantity
+        }).execute()
 
-    return {"status": "success", "message": "Addons added to booking"}
-
+    return {
+        "status": "success",
+        "message": "Add-ons updated successfully"
+    }
 # -------------------------
 # User Calculate Price API
 # -------------------------  
@@ -1397,9 +1545,11 @@ def calculate_price_internal(
     booking_type_id: str,
     adults: int,
     children: int,
-    addons: list[str]
+    addons: list[BookingAddonItem]
 ) -> dict:
 
+
+    # 1️⃣ Booking type price
     booking_type_result = supabase.table("booking_types") \
         .select("adult_price, child_price") \
         .eq("id", booking_type_id) \
@@ -1410,24 +1560,64 @@ def calculate_price_internal(
 
     bt = booking_type_result.data[0]
 
-    base = (adults * bt["adult_price"]) + (children * bt["child_price"])
+    base_price = (adults * bt["adult_price"]) + (children * bt["child_price"])
 
+    # 2️⃣ Addon price with quantity
     addon_total = 0
+
     if addons:
+        addon_ids = [a.addon_id for a in addons]
+
         addons_result = supabase.table("addons") \
             .select("id, price") \
-            .in_("id", addons) \
+            .in_("id", addon_ids) \
             .eq("is_active", True) \
             .execute()
 
-        addon_total = sum(a["price"] for a in addons_result.data)
+        addon_price_map = {
+            a["id"]: a["price"] for a in addons_result.data
+        }
+
+        for addon in addons:
+            price = addon_price_map.get(addon.addon_id, 0)
+            addon_total += price * addon.quantity
 
     return {
-        "base_price": base,
+        "base_price": base_price,
         "addon_total": addon_total,
-        "total": base + addon_total
+        "total": base_price + addon_total
     }
- 
+
+# -------------------------
+# Booking Addon Breakdown Helper (EMAIL + PDF)
+# -------------------------
+def get_booking_addon_breakdown(booking_id: str):
+    addons_res = supabase.table("booking_addons") \
+        .select("quantity, addons(name, price)") \
+        .eq("booking_id", booking_id) \
+        .execute()
+
+    addon_lines = []
+    addon_total = 0
+
+    for row in addons_res.data or []:
+        name = row["addons"]["name"]
+        price = row["addons"]["price"]
+        qty = row["quantity"]
+
+        total = price * qty
+        addon_total += total
+
+        addon_lines.append({
+            "name": name,
+            "price": price,
+            "quantity": qty,
+            "total": total
+        })
+
+    return addon_lines, addon_total
+
+
 @app.post("/calculate-price", tags=["User"])
 def calculate_price(data: PriceRequest):
     return calculate_price_internal(
@@ -1623,8 +1813,13 @@ def get_user_bookings(user_id: str):
         .eq("user_id", user_id) \
         .execute()
 
-def base_admin_booking_query():
-    return supabase_admin.table("bookings") \
+# -------------------------
+# Admin Show All Bookings API (ADMIN DASHBOARD LIST)
+# -------------------------
+@app.get("/admin/bookings", tags=["Admin"])
+def admin_all_bookings():
+
+    res = supabase_admin.table("bookings") \
         .select("""
             id,
             visit_date,
@@ -1642,14 +1837,16 @@ def base_admin_booking_query():
             booking_types(name),
             time_slots(slot_name,start_time,end_time)
         """) \
-        .order("created_at", desc=True)
+        .order("created_at", desc=True) \
+        .execute()
 
+    return res.data
 
 # -------------------------
-# Admin Show All Bookings API (ADMIN DASHBOARD LIST)
+# Admin Single Booking Details API (View Details Modal)
 # -------------------------
-@app.get("/admin/bookings", tags=["Admin"])
-def admin_all_bookings():
+@app.get("/admin/bookings/{booking_id}", tags=["Admin"])
+def admin_booking_details(booking_id: str):
 
     res = supabase_admin.table("bookings") \
         .select("""
@@ -1660,16 +1857,24 @@ def admin_all_bookings():
             children,
             total_amount,
             payment_status,
-            created_at,
+            payment_method,
             contact_name,
             contact_email,
+            contact_phone,
+            notes,
             booking_types(name),
             time_slots(slot_name,start_time,end_time)
-        """) \
-        .order("created_at", desc=True) \
+""") \
+        .eq("id", booking_id) \
+        .single() \
         .execute()
 
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
     return res.data
+
+
 
 # -------------------------
 # Admin Show Stats API
@@ -2104,7 +2309,7 @@ def confirm_booking(
     current_user_id: str = Depends(get_current_user)
 ):
     try:
-        # 1. Calculate price
+        # 1️⃣ PRICE CALCULATION (qty-aware)
         price = calculate_price_internal(
             data.booking_type_id,
             data.adults,
@@ -2113,7 +2318,7 @@ def confirm_booking(
         )
         total_amount = round(price["total"], 2)
 
-        # 2. Create booking using RPC (STATUS = PENDING inside RPC)
+        # 2️⃣ CREATE BOOKING (STATUS = PENDING)
         res = supabase_admin.rpc(
             "create_booking_safe",
             {
@@ -2138,7 +2343,16 @@ def confirm_booking(
 
         booking_id = res.data
 
-        # 3. Fetch booking details for email + PDF
+        # 3️⃣ ✅ SAVE ADDONS WITH QUANTITY (STEP 4 – IMPORTANT)
+        if data.addons:
+            for addon in data.addons:
+                supabase_admin.table("booking_addons").insert({
+                    "booking_id": booking_id,
+                    "addon_id": addon.addon_id,
+                    "quantity": addon.quantity
+                }).execute()
+
+        # 4️⃣ FETCH BOOKING DETAILS (EMAIL + PDF)
         booking_res = supabase.table("bookings") \
             .select("""
                 id,
@@ -2152,39 +2366,59 @@ def confirm_booking(
             """) \
             .eq("id", booking_id) \
             .execute()
-
+        
         if not booking_res.data:
             raise HTTPException(404, "Booking not found")
 
         booking = booking_res.data[0]
 
-        # 4. EMAIL BODY (PENDING)
+        # 🔹 FETCH ADDON BREAKDOWN
+        addon_lines, addon_total = get_booking_addon_breakdown(booking_id)
+        
+        # 🔹 ADDON HTML
+        addons_html = ""
+        if addon_lines:
+            addons_html = "<h4>Add-ons</h4><ul>"
+            for a in addon_lines:
+                addons_html += (
+            f"<li>{a['name']} "
+            f"(₹{a['price']} × {a['quantity']}) = ₹{a['total']}</li>"
+        )
+            addons_html += "</ul>"
+            addons_html += f"<p><b>Add-ons Total:</b> ₹{addon_total}</p>"
+        
+        # 5️⃣ EMAIL BODY (PENDING)
         email_body = f"""
-        <h2>Booking Received ⏳</h2>
+<h2>Booking Received ⏳</h2>
 
-        <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
-        <p><b>Name:</b> {booking['contact_name']}</p>
-        <p><b>Visit Date:</b> {booking['visit_date']}</p>
-        <p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
-        ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
-        <p><b>Adults:</b> {booking['adults']}</p>
-        <p><b>Children:</b> {booking['children']}</p>
+<p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
+<p><b>Name:</b> {booking['contact_name']}</p>
+<p><b>Visit Date:</b> {booking['visit_date']}</p>
+<p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
+({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
 
-        <hr/>
-        <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
-        <p><b>Status:</b> Pending admin confirmation</p>
+<p><b>Adults:</b> {booking['adults']}</p>
+<p><b>Children:</b> {booking['children']}</p>
 
-        <br/>
-        <p>Your booking request is under review.</p>
-        <p>You will receive a confirmation email once approved by admin.</p>
+<hr/>
 
-        <p>Thank you for choosing <b>Animal Farm</b> 🐄🌿</p>
-        """
+{addons_html}
 
-        # 5. Generate PDF receipt (optional but kept as you wanted)
+<hr/>
+
+<p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
+<p><b>Status:</b> Pending admin confirmation</p>
+
+<br/>
+<p>Your booking request is under review.</p>
+<p>You will receive a confirmation email once approved by admin.</p>
+
+<p>Thank you for choosing <b>Animal Farm</b> 🐄🌿</p>
+"""
+
+        # 6️⃣ GENERATE PDF
         pdf_path = generate_booking_receipt(booking)
-
-        # 6. Send email with PDF attachment
+        # 7️⃣ SEND EMAIL (BACKGROUND)
         background_tasks.add_task(
             send_email_with_attachment,
             data.contact_email,
@@ -2208,9 +2442,8 @@ def confirm_booking(
 
         raise HTTPException(500, "Booking request failed")
 
-
 # -------------------------
-# Confiirme booking by admin Booking Email API
+# Confirm booking by admin Booking Email API
 # -------------------------
 @app.post("/admin/bookings/{booking_id}/confirm", tags=["Admin"])
 def admin_confirm_booking(
@@ -2241,6 +2474,21 @@ def admin_confirm_booking(
 
     booking = res.data
 
+    # 🔹 ADDON BREAKDOWN
+    addon_lines, addon_total = get_booking_addon_breakdown(booking_id)
+
+    # 🔹 BUILD ADDONS HTML (✅ FIXED INDENT)
+    addons_html = ""
+    if addon_lines:
+        addons_html = "<h4>Add-ons</h4><ul>"
+        for a in addon_lines:
+            addons_html += (
+                f"<li>{a['name']} "
+                f"(₹{a['price']} × {a['quantity']}) = ₹{a['total']}</li>"
+            )
+        addons_html += "</ul>"
+        addons_html += f"<p><b>Add-ons Total:</b> ₹{addon_total}</p>"
+
     # Already confirmed check
     if booking["status"] == "confirmed":
         return {
@@ -2263,23 +2511,29 @@ def admin_confirm_booking(
 
     # Confirmation email body
     email_body = f"""
-    <h2>Booking Confirmed 🎉</h2>
+<h2>Booking Confirmed 🎉</h2>
 
-    <p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
-    <p><b>Name:</b> {booking['contact_name']}</p>
-    <p><b>Visit Date:</b> {booking['visit_date']}</p>
-    <p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
-    ({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
-    <p><b>Adults:</b> {booking['adults']}</p>
-    <p><b>Children:</b> {booking['children']}</p>
+<p><b>Booking:</b> {booking['booking_types']['icon']} {booking['booking_types']['name']}</p>
+<p><b>Name:</b> {booking['contact_name']}</p>
+<p><b>Visit Date:</b> {booking['visit_date']}</p>
+<p><b>Time Slot:</b> {booking['time_slots']['slot_name']}
+({booking['time_slots']['start_time']} - {booking['time_slots']['end_time']})</p>
 
-    <hr/>
-    <p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
-    <p><b>Payment:</b> Pay at counter</p>
+<p><b>Adults:</b> {booking['adults']}</p>
+<p><b>Children:</b> {booking['children']}</p>
 
-    <br/>
-    <p>We look forward to welcoming you at <b>Animal Farm</b> 🐄🌿</p>
-    """
+<hr/>
+
+{addons_html}
+
+<hr/>
+
+<p><b>Total Amount:</b> ₹{booking['total_amount']}</p>
+<p><b>Payment:</b> Pay at counter</p>
+
+<br/>
+<p>We look forward to welcoming you at <b>Animal Farm</b> 🐄🌿</p>
+"""
 
     # Generate PDF
     pdf_path = generate_booking_receipt(booking)
@@ -2297,10 +2551,6 @@ def admin_confirm_booking(
         "status": "success",
         "message": "Booking confirmed and email sent"
     }
-
-
-
-
 # -------------------------
 # Generate PDF Booking Receipt API
 # ------------------------- 
@@ -2308,6 +2558,7 @@ def generate_booking_receipt(booking):
     os.makedirs("receipts", exist_ok=True)
     filename = f"receipts/receipt_{booking['id']}.pdf"
 
+    addon_lines, addon_total = get_booking_addon_breakdown(booking["id"])
     c = canvas.Canvas(filename, pagesize=A4)
 
     # Header
@@ -2336,11 +2587,39 @@ def generate_booking_receipt(booking):
     c.drawString(50, 650, f"Adults: {booking['adults']}")
     c.drawString(50, 625, f"Children: {booking['children']}")
 
-    # Amount Section
-    c.drawString(50, 580, f"Total Amount: ₹{booking['total_amount']}")
-    c.drawString(50, 555, "Payment: Pay at counter")
+        # -------------------------
+    # Add-ons Section
+    # -------------------------
+    y = 590
 
-    # Footer (IMPORTANT: save आधी लिहायचं)
+    if addon_lines:
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(50, y, "Add-ons")
+        y -= 20
+
+    c.setFont("Helvetica", 11)
+
+    for a in addon_lines:
+        c.drawString(
+        60,
+        y,
+        f"• {a['name']} (₹{a['price']} × {a['quantity']}) = ₹{a['total']}"
+    )
+    y -= 18   # inside loop only
+
+# ⬇️ loop end
+    y -= 10
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y, f"Add-ons Total: ₹{addon_total}")
+    y -= 25
+       
+
+    # Amount Section
+    c.drawString(50, y, f"Total Amount: ₹{booking['total_amount']}")
+    y -= 25
+    c.drawString(50, y, "Payment: Pay at counter")
+
+    # Footer 
     c.setFont("Helvetica-Oblique", 10)
     c.drawString(50, 500, "Thank you for booking with Animal Farm")
 
@@ -2374,6 +2653,7 @@ def send_email_with_attachment(to_email, subject, body, pdf_path):
 
     except Exception as e:
         print("EMAIL FAILED:", e)
+
 
 
 # -------------------------
@@ -2470,17 +2750,7 @@ def filter_bookings(
     status: Optional[str] = None,
     current_user_id: str = Depends(get_current_admin)
 ):
-    try:
-        query = base_admin_booking_query()
-
-        if from_date:
-            query = query.gte("visit_date", from_date.isoformat())
-
-        if to_date:
-            query = query.lte("visit_date", to_date.isoformat())
-
-        if booking_source:
-            query = query.eq("booking_source", booking_source)
+    query = base_admin_booking_query()
 
         if booking_type_id:
             query = query.eq("booking_type_id", booking_type_id)
@@ -2495,8 +2765,9 @@ def filter_bookings(
             elif payment_received.lower() == "false":
                 query = query.eq("payment_received", False)
 
-        if status:
-            query = query.eq("status", status)
+    # 🔹 Booking type
+    if booking_type_id:
+        query = query.eq("booking_type_id", booking_type_id)
 
         res = query.execute()
         return res.data or []
