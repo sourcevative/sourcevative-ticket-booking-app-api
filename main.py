@@ -27,13 +27,16 @@ from openpyxl import Workbook
 from fastapi.responses import StreamingResponse
 from collections import Counter
 from collections import defaultdict
-
+import os
+os.environ["HTTPX_DISABLE_IPV6"] = "1"
 
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+print("SUPABASE_URL =", SUPABASE_URL)
+print("SUPABASE_KEY =", SUPABASE_KEY[:10])
 # Service role key bypasses RLS - use for admin operations
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 
@@ -2500,8 +2503,6 @@ def admin_confirm_booking(
     supabase_admin.table("bookings") \
         .update({
             "status": "confirmed",
-            "confirmed_by": current_user_id,
-            "confirmed_at": datetime.utcnow().isoformat()
         }) \
         .eq("id", booking_id) \
         .execute()
@@ -3238,5 +3239,5 @@ def send_payment_received_email_with_pdf(booking, pdf_path):
         booking["contact_email"],
         subject,
         body,
-        pdf_path
+        pdf_path #26/2/26
     )
